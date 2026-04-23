@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.spiritai_policy as spiritai_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -352,6 +353,57 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSpiritaiDataConfig(DataConfigFactory):
+    """Config for Spirit AI humanoid robot datasets in LeRobot format.
+
+    The Spirit AI moz1 robot stores state/action data as separate columns for each body part.
+    This config handles concatenation of those columns into combined state/action vectors
+    via the SpiritaiInputs transform.
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # No repack needed: SpiritaiInputs reads raw dataset columns directly and
+        # concatenates them into combined state/action vectors.
+        repack_transform = _transforms.Group()
+
+        data_transforms = _transforms.Group(
+            inputs=[spiritai_policy.SpiritaiInputs(model_type=model_config.model_type)],
+            outputs=[spiritai_policy.SpiritaiOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            # Apply delta conversion to joint dims, keep grippers absolute.
+            # Left arm: 7 joints (delta) + 1 psi (delta) + 1 gripper (abs)
+            # Right arm: 7 joints (delta) + 1 psi (delta) + 1 gripper (abs)
+            # Torso: 6 joints (delta)
+            # Base: 3 speed (delta)
+            delta_action_mask = _transforms.make_bool_mask(
+                8, -1,  # left arm: 8 delta, 1 abs (gripper)
+                8, -1,  # right arm: 8 delta, 1 abs (gripper)
+                6,      # torso: 6 delta
+                3,      # base: 3 delta
+            )
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # List all cmd columns so LeRobot creates action sequences for each.
+            action_sequence_keys=tuple(spiritai_policy.ACTION_KEYS),
         )
 
 
@@ -959,6 +1011,40 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # Spirit AI configs.
+    #
+    TrainConfig(
+        name="pi05_spiritai_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSpiritaiDataConfig(
+            repo_id="spiritai/20260420_FlodPaperbox_SFLDemo_Moz1WB",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Debugging configs.
