@@ -4,6 +4,18 @@ checkpoints/
 data/
 wandb/
 
+# IDE
+.vscode/
+
+# Kilo
+.kilo/
+
+# Virtual environments
+.venv_wandb_test/
+
+# Binary packages
+*.deb
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

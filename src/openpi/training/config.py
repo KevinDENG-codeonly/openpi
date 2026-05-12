@@ -558,7 +558,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 6
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -1026,20 +1026,22 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotSpiritaiDataConfig(
-            repo_id="spiritai/20260420_FlodPaperbox_SFLDemo_Moz1WB",
+            repo_id="spiritai/20260424_FoldPaperBox_Moz1WB_NoSlice_repaired",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=5_000,
+            decay_lr=2e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        log_interval=100,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",

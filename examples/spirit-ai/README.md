@@ -35,6 +35,7 @@ Spirit AI datasets often use the folder name as the task text, which is not a us
 ```bash
 # Dry-run: inspect the dataset
 uv run python examples/spirit-ai/check_instruction_manually.py \
+    --default_prompt "Your Prompt" \
     --dataset_dir /path/to/your_dataset
 
 # Apply fix: write a repaired copy with a proper instruction
@@ -74,7 +75,9 @@ data=LeRobotSpiritaiDataConfig(
 uv run python scripts/compute_norm_stats.py --config-name pi05_spiritai_lora
 ```
 
-This writes `norm_stats.json` to `./assets/pi05_spiritai_lora/<repo_id>/`.
+This writes `norm_stats.json` to `./assets/pi05_spiritai_lora/<repo_id>/`. The output path is determined by `config.assets_dirs / data_config.repo_id`, where `assets_dirs` resolves to `./assets/<config_name>` (i.e. `./assets/pi05_spiritai_lora`) and `repo_id` comes from your `LeRobotSpiritaiDataConfig`. Make sure to run this command from the repo root so that `./assets` resolves correctly.
+
+> **Tip:** You should see a log line like `Writing stats to: /path/to/openpi/assets/pi05_spiritai_lora/spiritai/your_dataset_name` — verify this matches the expected path before proceeding.
 
 ## Step 4: Run LoRA Fine-Tuning
 
@@ -83,6 +86,8 @@ uv run python scripts/train.py pi05_spiritai_lora \
     --exp_name my_experiment \
     --overwrite
 ```
+
+The training script automatically loads `norm_stats.json` from the same path that `compute_norm_stats.py` wrote to (`config.assets_dirs / asset_id`, where `asset_id` defaults to `repo_id` when no custom `assets.asset_id` is set). As long as you run from the repo root, the norm stats from Step 3 will be found. You should see a log line like `Loaded norm stats from ...` confirming the file was found; if missing, you'll see `Norm stats not found in ..., skipping.` instead.
 
 Common overrides:
 
