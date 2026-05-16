@@ -116,10 +116,151 @@ Checkpoints are saved to `checkpoints/pi05_spiritai_lora/<exp_name>/`.
 
 ## Step 5: Serve the Fine-Tuned Model
 
+### 5a. Quick serve with the `SPIRITAI` env mode
+
+The `SPIRITAI` env mode is registered in [`scripts/serve_policy.py`](../../scripts/serve_policy.py) with a default checkpoint. To serve it:
+
+```bash
+uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "fold the paper box"
+```
+
+> **Important:** `--default_prompt` is not hardcoded. Always pass the prompt that matches your task at runtime.
+
+### 5b. Specify a custom checkpoint directly
+
+To serve a specific checkpoint without modifying `serve_policy.py`:
+
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
     --policy.config pi05_spiritai_lora \
-    --policy.dir checkpoints/pi05_spiritai_lora/<exp_name>/<step>
+    --policy.dir checkpoints/pi05_spiritai_lora/<exp_name>/<step> \
+    --default_prompt "fold the paper box"
+```
+
+For example:
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config pi05_spiritai_lora \
+    --policy.dir checkpoints/pi05_spiritai_lora/20260424_FoldPaperBox_Moz1WB_NoSlice_repaired—_91ep_12000stp/11999 \
+    --default_prompt "fold the paper box"
+```
+
+### 5c. Switching to a new trained model
+
+When you train a new experiment, you have two options:
+
+**Option A** — Update the `DEFAULT_CHECKPOINT` in `serve_policy.py` so `--env SPIRITAI` points to the new checkpoint:
+
+```python
+# In scripts/serve_policy.py, find the DEFAULT_CHECKPOINT dict and update:
+EnvMode.SPIRITAI: Checkpoint(
+    config="pi05_spiritai_lora",
+    dir="checkpoints/pi05_spiritai_lora/<new_exp_name>/<new_step>",
+),
+```
+
+Fields to update:
+
+| Field | What to change |
+|-------|---------------|
+| `dir` | Path to the new checkpoint directory under `checkpoints/pi05_spiritai_lora/` |
+| `config` | Only change if you created a new training config in `config.py`; otherwise keep `pi05_spiritai_lora` |
+
+**Option B** — Skip modifying `serve_policy.py` and use `policy:checkpoint` with `--policy.dir` (see 5b above).
+
+### 5d. Switching models checklist
+
+1. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in [`scripts/serve_policy.py`](../../scripts/serve_policy.py) (if using `--env SPIRITAI`)
+2. Pass the correct `--default_prompt` for the new task
+3. Restart the server
+4. Verify the observation dict keys match what [`SpiritaiInputs`](../../src/openpi/policies/spiritai_policy.py) expects (see Step 6 below)
+
+## Step 6: Inference with Python Client
+
+Once the server is running (Step 5), you can query it from your robot code using the `openpi_client` package.
+
+### Install the client
+
+```bash
+cd $OPENPI_ROOT/packages/openpi-client
+pip install -e .
+```
+
+### Query the server
+
+The observation dict must match the keys expected by [`SpiritaiInputs`](../../src/openpi/policies/spiritai_policy.py). The required keys are:
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `cam_high` | `uint8` ndarray | `(H, W, 3)` | Overhead camera image |
+| `cam_left_wrist` | `uint8` ndarray | `(H, W, 3)` | Left wrist camera image |
+| `cam_right_wrist` | `uint8` ndarray | `(H, W, 3)` | Right wrist camera image |
+| `leftarm_state_joint_pos` | `float32` ndarray | `(7,)` | Left arm joint positions |
+| `leftarm_state_psi` | `float32` ndarray | `(1,)` | Left arm psi |
+| `leftarm_gripper_state_pos` | `float32` ndarray | `(1,)` | Left gripper position |
+| `rightarm_state_joint_pos` | `float32` ndarray | `(7,)` | Right arm joint positions |
+| `rightarm_state_psi` | `float32` ndarray | `(1,)` | Right arm psi |
+| `rightarm_gripper_state_pos` | `float32` ndarray | `(1,)` | Right gripper position |
+| `torso_state_joint_pos` | `float32` ndarray | `(6,)` | Torso joint positions |
+| `base_state_speed` | `float32` ndarray | `(3,)` | Base speed |
+| `prompt` | `str` | — | Task instruction |
+
+Example:
+
+```python
+from openpi_client import image_tools
+from openpi_client import websocket_client_policy
+
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+
+observation = {
+    "cam_high": image_tools.convert_to_uint8(image_tools.resize_with_pad(cam_high_img, 224, 224)),
+    "cam_left_wrist": image_tools.convert_to_uint8(image_tools.resize_with_pad(cam_left_wrist_img, 224, 224)),
+    "cam_right_wrist": image_tools.convert_to_uint8(image_tools.resize_with_pad(cam_right_wrist_img, 224, 224)),
+    "leftarm_state_joint_pos": leftarm_joint_pos,        # (7,) float32
+    "leftarm_state_psi": leftarm_psi,                    # (1,) float32
+    "leftarm_gripper_state_pos": leftarm_gripper_pos,    # (1,) float32
+    "rightarm_state_joint_pos": rightarm_joint_pos,      # (7,) float32
+    "rightarm_state_psi": rightarm_psi,                  # (1,) float32
+    "rightarm_gripper_state_pos": rightarm_gripper_pos,  # (1,) float32
+    "torso_state_joint_pos": torso_joint_pos,            # (6,) float32
+    "base_state_speed": base_speed,                      # (3,) float32
+    "prompt": "fold the paper box",
+}
+
+# Returns {"actions": ndarray of shape (action_horizon, 27)}
+result = client.infer(observation)
+action_chunk = result["actions"]
+```
+
+The returned `action_chunk` has shape `(action_horizon, 27)` where `action_horizon=10`. The 27 action dimensions follow the same order as the state keys but use `_cmd_` instead of `_state_`:
+
+| Dims | Description |
+|------|-------------|
+| 0–6 | Left arm joint commands |
+| 7 | Left arm psi command |
+| 8 | Left gripper command |
+| 9–15 | Right arm joint commands |
+| 16 | Right arm psi command |
+| 17 | Right gripper command |
+| 18–23 | Torso joint commands |
+| 24–26 | Base speed commands |
+
+> **Tip:** You typically call `client.infer()` every N steps and execute the predicted action chunk open-loop for the intermediate steps.
+
+### Quick smoke test with random data
+
+You can use the `make_spiritai_example()` helper from [`spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) to generate a random observation for testing:
+
+```python
+from openpi.policies.spiritai_policy import make_spiritai_example
+from openpi_client import websocket_client_policy
+
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+example = make_spiritai_example()
+result = client.infer(example)
+print("Actions shape:", result["actions"].shape)  # (10, 27)
 ```
 
 ## Architecture Reference
@@ -128,6 +269,7 @@ uv run scripts/serve_policy.py policy:checkpoint \
 
 | File | Purpose |
 |------|---------|
+| [`scripts/serve_policy.py`](../../scripts/serve_policy.py) | Policy server with `SPIRITAI` env mode and `DEFAULT_CHECKPOINT` |
 | [`src/openpi/policies/spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) | Input/output transforms (`SpiritaiInputs`, `SpiritaiOutputs`) |
 | [`src/openpi/training/config.py`](../../src/openpi/training/config.py) | `LeRobotSpiritaiDataConfig` and `pi05_spiritai_lora` TrainConfig |
 | [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
@@ -152,3 +294,15 @@ To train on a different Spirit AI dataset:
 3. Update `repo_id` in the `pi05_spiritai_lora` config in `config.py`
 4. Re-run `compute_norm_stats.py` (Step 3 above)
 5. Start training (Step 4 above)
+6. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in `serve_policy.py` and serve the new model (Step 5 above)
+
+### Full Workflow: Training a New Model → Inference
+
+1. Prepare & fix dataset instructions → Step 1
+2. Create symlink → Step 2
+3. Update `repo_id` in `config.py` → Step 2
+4. Compute norm stats → Step 3
+5. Train → Step 4
+6. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in `serve_policy.py` → Step 5c
+7. Serve → `uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "your task"`
+8. Query from robot → Step 6
