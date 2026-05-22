@@ -263,6 +263,143 @@ result = client.infer(example)
 print("Actions shape:", result["actions"].shape)  # (10, 27)
 ```
 
+## Step 7: Real Robot Inference
+
+This step runs the full closed-loop inference: Policy Server on GPU ↔ Moz1 robot via SDK + network.
+
+### Architecture
+
+```
+GPU Server (serve_policy.py)
+   ↕ WebSocket :8000
+Robot Control Machine (main.py)
+   ├── Moz SDK → capture_observation() → send_action()
+   ↕ ROS2 / CycloneDDS (network cable)
+Moz1 Robot (172.16.0.30)
+```
+
+*If the GPU server and robot control machine are the same host*, use `--args.host localhost`.
+
+### 7a. Prerequisites
+
+1. **Install Moz Robot SDK** (`mozrobot` wheel)
+2. **Install openpi-client** (Step 6) and additional dependencies:
+
+```bash
+pip install scipy tyro typing_extensions -i https://pypi.tuna.tsinghua.edu.cn/simple/ --trusted-host pypi.tuna.tsinghua.edu.cn
+```
+
+3. **Set PYTHONPATH** (required for both `openpi_client` and the spirit-ai example):
+
+```bash
+export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH
+```
+
+4. **ROS2 environment** (required by Moz SDK):
+
+```bash
+source /opt/ros/humble/setup.bash
+```
+
+5. **Network configuration** — see 7c below.
+
+### 7b. Run
+
+Terminal 1 — Start Policy Server (in `uv` managed environment):
+
+```bash
+uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "fold the paper box"
+```
+
+Terminal 2 — Start Robot Client (in system Python with ROS2):
+
+```bash
+export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH
+source /opt/ros/humble/setup.bash
+
+python3 examples/spirit-ai/main.py \
+    --args.host localhost \
+    --args.prompt "fold the paper box"
+```
+
+All CLI parameters (use `--args.<field>` prefix):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--args.host` | `0.0.0.0` | Policy Server IP (`localhost` if same machine) |
+| `--args.port` | `8000` | Policy Server port |
+| `--args.realsense_serials` | `230322270398,313522302626,230422271253` | Camera serial numbers (comma-separated) |
+| `--args.camera_resolutions` | `320*240,320*240,320*240` | Camera resolutions |
+| `--args.structure` | `wholebody` | Robot structure (`wholebody` / `wholebody_without_base` / `dualarm`) |
+| `--args.prompt` | `fold the paper box` | Task instruction (should match server's `--default_prompt`) |
+| `--args.action_horizon` | `40` | Steps per inference cycle (10 model steps × 4x resample) |
+| `--args.resample_ratio` | `4.0` | Resample from model Hz to 120Hz control |
+| `--args.num_episodes` | `1` | Number of episodes |
+| `--args.max_episode_steps` | `2000` | Max steps per episode |
+
+### 7c. Network Configuration (CycloneDDS)
+
+The Moz SDK uses CycloneDDS (ROS2 middleware) to communicate with the robot. A `cyclonedds.xml` configuration file is required. Example at `/path/to/mozrobot-0.1.3/cyclonedds.xml`.
+
+**Critical**: The `NetworkInterfaceAddress` must match **your server's IP** on the robot subnet, NOT the robot's IP.
+
+```xml
+<General>
+    <!-- This must be YOUR machine's IP on the 172.16.0.x subnet -->
+    <NetworkInterfaceAddress>172.16.0.50</NetworkInterfaceAddress>
+    <AllowMulticast>false</AllowMulticast>
+</General>
+<Discovery>
+    <Peers>
+        <Peer address="172.16.0.30"/>  <!-- Robot controller IP -->
+        <Peer address="127.0.0.1"/>     <!-- Local loopback -->
+    </Peers>
+</Discovery>
+```
+
+To find your machine's IP on the robot subnet:
+
+```bash
+ip addr | grep "172.16"
+```
+
+> **Common error**: `does not match an available interface` — means `NetworkInterfaceAddress` is wrong. Update it to your actual IP.
+
+### 7d. How It Works
+
+The inference loop runs at 120Hz:
+
+1. **`env.get_observation()`** — Reads robot state + cameras via Moz SDK, adds `prompt`
+2. **`ActionChunkResampleBroker.infer()`** — Sends observation to Policy Server via WebSocket, receives `(10, 27)` action chunk
+3. **Split + Resample** — The 27-dim flat action is split into 8 named keys, then resampled from ~30Hz to 120Hz via PchipInterpolator (4x ratio → 40 control steps)
+4. **`env.apply_action()`** — Each resampled step is sent to the robot as `send_action()` at 120Hz
+5. After 40 steps, triggers next inference → repeat
+
+**Data flow**:
+
+```
+Policy Server returns: {"actions": (10, 27)}
+  ↓ split_actions()
+  {"leftarm_cmd_joint_pos": (10,7), "leftarm_cmd_psi": (10,1), ..., "base_cmd_speed": (10,3)}
+  ↓ _resample_action (4x interpolation)
+  List of 40 dicts, each with named keys matching SDK send_action format
+  ↓ robot.send_action() @ 120Hz
+  Robot executes actions
+```
+
+**Psi handling**: Currently `leftarm_state_psi` and `rightarm_state_psi` are set to `np.zeros(1)` in `env.py`. Update if your model requires actual psi values.
+
+### 7e. Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `does not match an available interface` | `cyclonedds.xml` NetworkInterfaceAddress wrong | Update to your server's IP on 172.16.0.x subnet |
+| `No device connected` (camera) | RealSense cameras not plugged in or wrong serials | Check `rs-enumerate-devices`, verify serial numbers |
+| `rcl node's rmw handle is invalid` | ROS2 DDS can't reach robot | Check network, verify `cyclonedds.xml`, ensure `source /opt/ros/humble/setup.bash` |
+| `ModuleNotFoundError: No module named 'openpi_client'` | PYTHONPATH not set | `export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH` |
+| `Unrecognized options: --host` | tyro requires nested prefix | Use `--args.host` instead of `--host` |
+| `ConnectionRefusedError` | Policy Server not running | Start server first: `uv run scripts/serve_policy.py --env SPIRITAI` |
+
 ## Architecture Reference
 
 ### Files
@@ -273,6 +410,9 @@ print("Actions shape:", result["actions"].shape)  # (10, 27)
 | [`src/openpi/policies/spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) | Input/output transforms (`SpiritaiInputs`, `SpiritaiOutputs`) |
 | [`src/openpi/training/config.py`](../../src/openpi/training/config.py) | `LeRobotSpiritaiDataConfig` and `pi05_spiritai_lora` TrainConfig |
 | [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
+| [`examples/spirit-ai/main.py`](main.py) | Real robot inference entry point |
+| [`examples/spirit-ai/env.py`](env.py) | MOZ1 robot environment (SDK → observation/action) |
+| [`packages/openpi-client/src/openpi_client/action_chunk_resample_broker.py`](../../packages/openpi-client/src/openpi_client/action_chunk_resample_broker.py) | Action chunk splitting (27→8 keys) + 30Hz→120Hz resampling |
 
 ### Data Flow
 
@@ -306,3 +446,4 @@ To train on a different Spirit AI dataset:
 6. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in `serve_policy.py` → Step 5c
 7. Serve → `uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "your task"`
 8. Query from robot → Step 6
+9. Real robot inference → Step 7
