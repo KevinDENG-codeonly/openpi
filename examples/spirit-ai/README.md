@@ -81,15 +81,23 @@ This writes `norm_stats.json` to `./assets/pi05_spiritai_lora/<repo_id>/`. The o
 
 ## Step 4: Run LoRA Fine-Tuning
 
+Training should be started inside `tmux` so the process survives terminal disconnects or UI crashes. This is especially important when checkpoint writes take a long time: if the terminal session dies during a slow disk write, the weight file may be left incomplete or fail to save.
+
 ```bash
+tmux new -s spiritai_train
+
 uv run python scripts/train.py pi05_spiritai_lora \
     --exp_name my_experiment \
     --overwrite
 ```
 
+Detach with `Ctrl-b` then `d`; reattach with `tmux attach -t spiritai_train`.
+
 The training script automatically loads `norm_stats.json` from the same path that `compute_norm_stats.py` wrote to (`config.assets_dirs / asset_id`, where `asset_id` defaults to `repo_id` when no custom `assets.asset_id` is set). As long as you run from the repo root, the norm stats from Step 3 will be found. You should see a log line like `Loaded norm stats from ...` confirming the file was found; if missing, you'll see `Norm stats not found in ..., skipping.` instead.
 
 Common overrides:
+
+Run these commands inside the same `tmux` session:
 
 ```bash
 # Short smoke test (10 steps, batch size 1)
@@ -148,7 +156,7 @@ uv run scripts/serve_policy.py policy:checkpoint \
 
 ### 5c. Switching to a new trained model
 
-When you train a new experiment, you have two options:
+When you train a new experiment, choose one of these options:
 
 **Option A** — Update the `DEFAULT_CHECKPOINT` in `serve_policy.py` so `--env SPIRITAI` points to the new checkpoint:
 
@@ -169,12 +177,7 @@ Fields to update:
 
 **Option B** — Skip modifying `serve_policy.py` and use `policy:checkpoint` with `--policy.dir` (see 5b above).
 
-### 5d. Switching models checklist
-
-1. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in [`scripts/serve_policy.py`](../../scripts/serve_policy.py) (if using `--env SPIRITAI`)
-2. Pass the correct `--default_prompt` for the new task
-3. Restart the server
-4. Verify the observation dict keys match what [`SpiritaiInputs`](../../src/openpi/policies/spiritai_policy.py) expects (see Step 6 below)
+In both cases, pass the correct `--default_prompt`, restart the server, and verify the observation dict keys match what [`SpiritaiInputs`](../../src/openpi/policies/spiritai_policy.py) expects (see Step 6 below).
 
 ## Step 6: Inference with Python Client
 
@@ -433,17 +436,7 @@ To train on a different Spirit AI dataset:
 2. Update the symlink (Step 2 above) or create a new one
 3. Update `repo_id` in the `pi05_spiritai_lora` config in `config.py`
 4. Re-run `compute_norm_stats.py` (Step 3 above)
-5. Start training (Step 4 above)
+5. Start training in `tmux` (Step 4 above)
 6. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in `serve_policy.py` and serve the new model (Step 5 above)
 
-### Full Workflow: Training a New Model → Inference
-
-1. Prepare & fix dataset instructions → Step 1
-2. Create symlink → Step 2
-3. Update `repo_id` in `config.py` → Step 2
-4. Compute norm stats → Step 3
-5. Train → Step 4
-6. Update `DEFAULT_CHECKPOINT[EnvMode.SPIRITAI].dir` in `serve_policy.py` → Step 5c
-7. Serve → `uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "your task"`
-8. Query from robot → Step 6
-9. Real robot inference → Step 7
+For the full training-to-inference workflow, follow Steps 1-7 in order: prepare the dataset, create the symlink, update `repo_id`, compute norm stats, train, serve the checkpoint, then query it from the Python client or the real robot entry point.

@@ -1026,7 +1026,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotSpiritaiDataConfig(
-            repo_id="spiritai/20260424_FoldPaperBox_Moz1WB_NoSlice_repaired",
+            repo_id="spiritai/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_NoSlice_repaired",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
