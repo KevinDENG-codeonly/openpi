@@ -250,6 +250,21 @@ The returned `action_chunk` has shape `(action_horizon, 27)` where `action_horiz
 | 18–23 | Torso joint commands |
 | 24–26 | Base speed commands |
 
+### Action semantics
+
+For the current `pi05_spiritai_lora` config, `extra_delta_transform=False`. This means openpi does **not** convert the dataset actions into `cmd - state` deltas during training, and it does **not** add the current state back to the predicted actions during inference.
+
+The model input `state` is the normalized form of the absolute robot state columns:
+
+- arm joint positions and psi values are absolute positions;
+- gripper state is an absolute discrete/open-close state (0/1 in the current Spirit AI data);
+- torso joint positions are absolute positions;
+- base state is the current base speed.
+
+The policy output is the unnormalized 27-dim action chunk in the raw dataset `*_cmd_*` semantics. For the current Spirit AI datasets, the joint/psi/torso command columns are absolute command targets, and gripper commands are absolute 0/1 states. Do **not** add the current state to `result["actions"]` for this config; doing so would double-count the position commands.
+
+If you intentionally train a delta-action model, enable the corresponding delta transform consistently during training and inference, or add the current state on the robot client side with a carefully chosen per-dimension mask.
+
 > **Tip:** You typically call `client.infer()` every N steps and execute the predicted action chunk open-loop for the intermediate steps.
 
 ### Quick smoke test with random data
@@ -420,7 +435,7 @@ Policy Server returns: {"actions": (10, 27)}
 ### Data Flow
 
 1. **LeRobot** loads the dataset and creates action sequences from the 8 `*_cmd_*` columns (via `action_sequence_keys`)
-2. **`SpiritaiInputs`** concatenates the 8 state columns into a 27-dim `state` vector, parses 3 camera images, and concatenates action columns into a 27-dim `actions` vector
+2. **`SpiritaiInputs`** concatenates the 8 absolute state columns into a 27-dim `state` vector, parses 3 camera images, and concatenates raw `*_cmd_*` action columns into a 27-dim `actions` vector
 3. **Model transforms** pad state/actions to 32 dims (π0.5's `action_dim`), resize images to 224×224, tokenize the prompt
 4. **`SpiritaiOutputs`** slices the first 27 dims from the padded 32-dim model output
 
