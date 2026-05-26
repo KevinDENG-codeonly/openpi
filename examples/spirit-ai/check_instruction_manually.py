@@ -19,8 +19,8 @@ Usage (apply fix, write repaired copy):
 """
 
 import json
-import os
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import tyro
@@ -29,7 +29,7 @@ import tyro
 def _read_jsonl(path: Path) -> list[dict]:
     """Read a JSONL file and return a list of dicts."""
     items = []
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -39,7 +39,7 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 def _write_jsonl(path: Path, items: list[dict]) -> None:
     """Write a list of dicts to a JSONL file."""
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -60,10 +60,87 @@ def _check_tasks(tasks: list[dict], default_prompt: str) -> dict:
         "missing": len(missing),
         "mismatched": len(mismatched),
         "mismatched_details": [
-            {"task_index": t["task_index"], "current": t.get("task", "")} for t in mismatched
+            {"task_index": t.get("task_index", "<missing>"), "current": t.get("task", "")} for t in mismatched
         ],
         "needs_fix": len(missing) > 0 or len(mismatched) > 0,
     }
+
+
+def _extract_subtask_segments(episode: dict) -> list[dict]:
+    """Return subtask labeling segments from an episode, if present."""
+    annotation_data = episode.get("annotation", {}).get("annotation_data", {})
+    segments = annotation_data.get("data")
+    return segments if isinstance(segments, list) else []
+
+
+def _check_subtask_labeling(episodes: list[dict]) -> dict:
+    """Summarize optional per-episode subtask labeling metadata."""
+    total = len(episodes)
+    segment_counts = []
+    action_counts = Counter()
+    action_english_counts = Counter()
+    version_counts = Counter()
+
+    for episode in episodes:
+        annotation_data = episode.get("annotation", {}).get("annotation_data", {})
+        if annotation_data:
+            version_counts[annotation_data.get("version", "unknown")] += 1
+
+        segments = _extract_subtask_segments(episode)
+        segment_counts.append(len(segments))
+        for segment in segments:
+            action = segment.get("action")
+            action_english = segment.get("action_english")
+            if action:
+                action_counts[action] += 1
+            if action_english:
+                action_english_counts[action_english] += 1
+
+    labeled_counts = [count for count in segment_counts if count > 0]
+    return {
+        "total_episodes": total,
+        "labeled_episodes": len(labeled_counts),
+        "segment_count_min": min(labeled_counts) if labeled_counts else 0,
+        "segment_count_max": max(labeled_counts) if labeled_counts else 0,
+        "segment_count_distribution": dict(Counter(labeled_counts)),
+        "versions": dict(version_counts),
+        "actions": action_counts.most_common(),
+        "actions_english": action_english_counts.most_common(),
+        "present": bool(labeled_counts),
+    }
+
+
+def _print_subtask_labeling_summary(summary: dict) -> None:
+    """Print optional subtask labeling information without making it a pass/fail condition."""
+    print("Subtask labeling:")
+    if summary["total_episodes"] == 0:
+        print("  Present:         unknown (episodes metadata not found)")
+        print()
+        return
+
+    print(f"  Present:         {'yes' if summary['present'] else 'no'}")
+    print(f"  Episodes:        {summary['labeled_episodes']}/{summary['total_episodes']}")
+    if not summary["present"]:
+        print("  Note:            optional, but useful for downstream analysis/training.")
+        print()
+        return
+
+    print(f"  Segments/episode: min={summary['segment_count_min']} max={summary['segment_count_max']}")
+    print(f"  Distribution:    {summary['segment_count_distribution']}")
+    if summary["versions"]:
+        print(f"  Versions:        {summary['versions']}")
+
+    actions_english = summary["actions_english"]
+    actions = summary["actions"]
+    if actions_english:
+        print(f"  Unique subtasks: {len(actions_english)}")
+        for action, count in actions_english:
+            print(f"    - {action!r} ({count} episodes)")
+    elif actions:
+        print(f"  Unique subtasks: {len(actions)}")
+        for action, count in actions:
+            print(f"    - {action!r} ({count} episodes)")
+    print()
 
 
 def _fix_tasks(tasks: list[dict], default_prompt: str) -> list[dict]:
@@ -159,6 +236,10 @@ def main(
     for d in check["mismatched_details"]:
         print(f"    task_index={d['task_index']}: {d['current']!r}")
     print()
+
+    # --- Check optional subtask labeling metadata ---
+    subtask_check = _check_subtask_labeling(episodes)
+    _print_subtask_labeling_summary(subtask_check)
 
     if not check["needs_fix"]:
         print("PASS - All tasks already have the expected instruction. No fix needed.")
