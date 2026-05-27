@@ -28,6 +28,24 @@ Cameras: `cam_high` (overhead), `cam_left_wrist`, `cam_right_wrist`.
 - A dataset collected on the moz1 robot in **LeRobot v2.1** format
 - GPU with ≥24 GB VRAM (e.g. NVIDIA 4090 / A5000)
 
+## Current Workflow
+
+Use this page as the main path from dataset preparation to real robot inference:
+
+1. Prepare and repair dataset instructions.
+2. Create the local LeRobot symlink and compute norm stats.
+3. Fine-tune `pi05_spiritai_lora`.
+4. Serve a checkpoint with `serve_policy.py`.
+5. Validate policy output with the Python client.
+6. Run real robot inference through the Thor `robot_server` bridge.
+
+Operational notes and tuning history live in separate files:
+
+| File | Purpose |
+|------|---------|
+| [`real_robot_notes.md`](real_robot_notes.md) | Current Thor deployment status, motion findings, and next engineering work |
+| [`motion_benchmark_plan.md`](motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
+
 ## Step 1: Check & Fix Dataset Instructions
 
 Spirit AI datasets often use the folder name as the task text, which is not a useful language instruction for the model. Use the provided utility to check and fix this:
@@ -121,6 +139,73 @@ uv run python scripts/train.py pi05_spiritai_lora \
 ```
 
 Checkpoints are saved to `checkpoints/pi05_spiritai_lora/<exp_name>/`.
+
+### 4a. Fine-tuning parameters and action horizon
+
+The current Spirit AI training config is [`pi05_spiritai_lora`](../../src/openpi/training/config.py). The most important fields are:
+
+| Parameter | Current role |
+|-----------|--------------|
+| `model.action_horizon` | Number of future action frames predicted by one policy call |
+| `model.action_dim` | Padded model action dimension; current SpiritAI uses 27 real dims padded to 32 |
+| `data.repo_id` | LeRobot dataset used for training and norm stats |
+| `data.extra_delta_transform` | Whether absolute actions are converted to deltas during training |
+| `batch_size` | Number of training samples per optimizer step |
+| `lr_schedule` | Learning-rate schedule for LoRA fine-tuning |
+| `num_train_steps` | Total optimizer steps |
+| `freeze_filter` | Which parameters stay frozen; current config trains LoRA adapters only |
+
+For the current checkpoint, `action_horizon=10`, so the policy returns:
+
+```text
+(10, 27)
+```
+
+The model architecture can support longer horizons. For example, π0 configs commonly use larger horizons, and `sample_actions()` generates tensors shaped by the configured `model.action_horizon`. However, a checkpoint trained with `action_horizon=10` should be treated as a 10-frame policy. Do not simply change the inference config to `30` and expect the existing checkpoint to produce reliable 30-frame behavior; the extra horizon would be outside the training distribution.
+
+If longer action chunks are desired, train a new config or continue fine-tuning with a longer horizon:
+
+```python
+TrainConfig(
+    name="pi05_spiritai_lora_h20",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=20,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ),
+    data=LeRobotSpiritaiDataConfig(...),
+    ...
+)
+```
+
+Recommended horizon experiment order:
+
+| Horizon | Use case | Risk |
+|---------|----------|------|
+| `10` | Current baseline; frequent visual feedback | More chunk boundaries |
+| `16` | First longer-horizon experiment | Moderate open-loop drift |
+| `20` | Good candidate for reducing chunk-boundary artifacts | More open-loop execution |
+| `30` | Only after 16/20 work well | Long open-loop duration; higher contact-task risk |
+
+Longer horizon is not automatically better. At `source_hz=15`, a 10-frame chunk lasts about `9/15 = 0.6s`, while a 30-frame chunk lasts about `29/15 = 1.93s`. Fewer policy calls can improve continuity, but the robot also runs longer without fresh image feedback. For contact-rich tasks such as folding a paper box, a good deployment pattern is usually:
+
+```text
+predict 16-20 frames, execute only the first 6-10 frames, then replan
+```
+
+This receding-horizon setup keeps some future context while avoiding a long open-loop rollout.
+
+Other fine-tuning parameters:
+
+- `batch_size`: Larger values improve gradient stability but require more VRAM. With a 48GB inference/training GPU, increasing batch size may be possible, but it should be validated with a short smoke run.
+- `num_train_steps`: More steps can improve task fit, but overtraining may reduce robustness. Track validation rollouts or at least policy-only output statistics across checkpoints.
+- `lr_schedule.peak_lr`: Higher learning rate adapts faster but can destabilize LoRA fine-tuning. Current `2e-5` is conservative.
+- `save_interval`: Controls checkpoint frequency. Shorter intervals make it easier to compare checkpoints during robot testing.
+- `data.extra_delta_transform`: Must match action semantics. Current SpiritAI actions are absolute joint targets, so this stays `False`. If training a delta-action policy, robot-side inference must add the current state back with the same per-dimension mask.
+- `prompt_from_task` / `--default_prompt`: Language must match the training instruction distribution. A mismatch can preserve low-level motion but weaken task intent.
 
 ## Step 5: Serve the Fine-Tuned Model
 
@@ -454,124 +539,21 @@ For the current Thor metadata (`joint_dim=25`, `accepted_joint_dims=[16, 22, 25]
 | `accepted: false` ack | Server is busy or rejected the chunk | Check `docker logs -f robot_server`; reduce load and retry |
 | `ModuleNotFoundError: No module named 'openpi_client'` | Environment is missing workspace package | Run through `uv run` from the openpi repo root |
 
-### 7g. Current Real Robot Deployment Notes
+### 7g. Operational Notes and Benchmarking
 
-This section summarizes the current Thor `robot_server` deployment work and the latest motion tuning observations.
+Keep the main README focused on the standard deployment path. Use these companion notes for current real robot findings:
 
-#### Deployment status
+| File | Purpose |
+|------|---------|
+| [`real_robot_notes.md`](real_robot_notes.md) | Current Thor deployment status, motion findings, and recommended next engineering work |
+| [`motion_benchmark_plan.md`](motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
 
-- Thor `robot_server` is running in Docker and listening on `ws://172.16.0.30:8766`.
-- Precision connects to the local policy server at `localhost:8000` and bridges actions to Thor through [`main.py`](main.py).
-- The current Thor metadata is `structure=wholebody`, `joint_dim=25`, and `accepted_joint_dims=[16, 22, 25]`.
-- External following must be enabled before real motion. Use `--enable-external-following`; without it, the server accepts commands but arm joint states do not meaningfully follow.
-- The bridge sends 25D joint commands in this layout:
+Current short summary:
 
-```text
-[left_joints(7), left_gripper(1),
- right_joints(7), right_gripper(1),
- torso_joints(6), base_speed(3)]
-```
-
-#### Work completed so far
-
-- Replaced the old direct SDK/RealSense real robot entry path with a two-machine bridge.
-- Added protocol support to request external following mode through `robot_server`.
-- Added chunk-start smoothing:
-  - `--blend-steps`
-  - `--rollback-guard-steps`
-  - `--rollback-scale`
-- Added Precision-side motion limiting before sending commands to Thor:
-  - `--max-arm-velocity-rad-s`
-  - `--max-torso-velocity-rad-s`
-  - `--max-gripper-velocity-s`
-  - `--max-base-speed`
-  - `--max-joint-accel-rad-s2`
-- Added per-step logs for:
-  - actual state delta since the previous chunk
-  - command first-frame delta by group
-  - raw vs limited max velocity
-  - `limited_fraction`
-
-#### Important behavior found during testing
-
-The robot now moves reliably with external following enabled, but the latest real robot tests show a tradeoff:
-
-- Strong velocity limiting reduces visible shaking.
-- Strong velocity limiting also makes the executed path differ from the policy output, which can reduce continuity and task progress.
-- `--prefetch-next-chunk` reduces waiting between chunks, but it can use an observation captured before the robot reaches the end of the current chunk. If the next policy output is based on that stale observation, the next chunk can fight the actual robot state.
-- `--no-prefetch-next-chunk` made the motion slightly less shaky in testing, but continuity became worse because every chunk waits for the previous chunk to finish before doing the next policy call.
-- Lowering `source_hz` slows the same 10-frame action chunk down. This can reduce speed-related shaking, but it also increases task latency.
-- Increasing `source_hz` may improve responsiveness and training-frequency match, but it can increase chunk turnover and make boundary artifacts more visible unless the command path is smooth enough.
-
-#### Recent benchmark observations
-
-Manual scores from recent tests:
-
-| Setting | Jitter | Continuity | Task intent | Notes |
-|---------|--------|------------|-------------|-------|
-| `source_hz=15`, `arm=0.28`, `torso=0.15`, `accel=0.8`, prefetch `0.85` | noticeable shake | medium-low | good | `limited_fraction` often around `0.45-0.60` |
-| Same, prefetch `0.1` | worse shake | poor | unstable | prefetch likely too early; stale observation effect |
-| Same, `--no-prefetch-next-chunk` | slightly less shake | poor | acceptable | less stale observation, but chunk-to-chunk waiting hurts continuity |
-
-Earlier coarse benchmark trend:
-
-| Variable | Observed trend |
-|----------|----------------|
-| Lower velocity | less shaking, but too low can make motion slow and discontinuous |
-| Higher velocity | more responsive, but shaking returns more easily |
-| `accel=0.0` | least shaking in earlier notes, but continuity was worse |
-| `accel=0.8-1.2` | better continuity, slightly more shaking |
-| `source_hz=12` | more continuous but weaker task intent |
-| `source_hz=15` | best balance seen so far |
-| `source_hz=20` | more responsive but can shake more |
-
-#### Current interpretation
-
-The remaining issue is probably not one single parameter. The likely causes are:
-
-1. **Policy output is still high-velocity relative to safe real robot execution.** Logs often show `raw_max_vel` much larger than `limited_max_vel`.
-2. **The limiter is changing a large fraction of the output.** `limited_fraction` around `0.45-0.60` means the executed trajectory is materially different from the model output.
-3. **Chunk-level control is fighting continuous motion.** Each 10-frame policy chunk is smoothed locally, but there is no global continuous trajectory optimizer across chunks.
-4. **Prefetch is a tradeoff, not a clear win.** Early prefetch can be stale; no prefetch adds inference gaps.
-5. **Thor-side interpolation is still PCHIP per chunk.** It upsamples each received chunk to 120Hz, but it does not enforce global velocity, acceleration, or jerk continuity across chunk boundaries.
-
-#### Recommended pause point
-
-Do not keep increasing `--max-steps` until the short-run behavior is understood. Use `--max-steps 5` or `10` for further experiments.
-
-The current safest reference command for analysis is:
-
-```bash
-uv run python examples/spirit-ai/main.py \
-  --policy-host localhost \
-  --policy-port 8000 \
-  --robot-url ws://172.16.0.30:8766 \
-  --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps" \
-  --enable-external-following \
-  --startup-delay-s 10 \
-  --source-hz 15 \
-  --blend-steps 4 \
-  --rollback-guard-steps 4 \
-  --rollback-scale 0.2 \
-  --max-arm-velocity-rad-s 0.28 \
-  --max-torso-velocity-rad-s 0.15 \
-  --max-gripper-velocity-s 0.8 \
-  --max-base-speed 0.05 \
-  --max-joint-accel-rad-s2 0.8 \
-  --no-prefetch-next-chunk \
-  --max-steps 10
-```
-
-Use [`motion_benchmark_plan.md`](motion_benchmark_plan.md) for the full benchmark matrix.
-
-#### Likely next engineering step
-
-Parameter tuning alone is reaching diminishing returns. The next code-level improvement should be one of:
-
-- Add a cross-chunk trajectory buffer that blends from the currently executing tail into the next policy chunk instead of sending independent chunks.
-- Move velocity/acceleration/jerk limiting to Thor after PCHIP resampling, so the final 120Hz command stream is globally limited.
-- Add log metrics for policy inference latency, chunk idle time, and boundary discontinuity between previous chunk tail and new chunk head.
-- Compare against a recorded human/demo joint trajectory replay through the same `robot_server` path. If replay is smooth but policy is not, the issue is mostly policy output/noise. If replay also shakes, the issue is lower in the robot command/interpolation path.
+- The robot moves reliably after `--enable-external-following`.
+- Motion tuning is now limited more by chunk-to-chunk execution and control smoothness than by one obvious CLI parameter.
+- Use short runs (`--max-steps 5` or `10`) while debugging.
+- Do not keep lowering velocity blindly; if `limited_fraction` is already around `0.45-0.60`, the bridge is materially changing the policy output.
 
 ## Architecture Reference
 
@@ -586,6 +568,8 @@ Parameter tuning alone is reaching diminishing returns. The next code-level impr
 | [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
 | [`examples/spirit-ai/main.py`](main.py) | Default real robot bridge entry point for Precision policy server ↔ Thor `robot_server` |
 | [`examples/spirit-ai/env.py`](env.py) | Legacy direct MOZ1 SDK environment kept for reference |
+| [`examples/spirit-ai/real_robot_notes.md`](real_robot_notes.md) | Current deployment notes and motion-tuning interpretation |
+| [`examples/spirit-ai/motion_benchmark_plan.md`](motion_benchmark_plan.md) | Motion smoothness benchmark matrix |
 
 ### Data Flow
 
@@ -598,6 +582,8 @@ Parameter tuning alone is reaching diminishing returns. The next code-level impr
 ### Training Config
 
 The `pi05_spiritai_lora` config fine-tunes π0.5 with LoRA adapters on both the vision-language backbone (`gemma_2b_lora`) and the action expert (`gemma_300m_lora`). Base weights are loaded from the official π0.5 checkpoint. All non-LoRA parameters are frozen.
+
+For action horizon and fine-tuning parameter guidance, see [Step 4a](#4a-fine-tuning-parameters-and-action-horizon).
 
 ### Switching Datasets
 
