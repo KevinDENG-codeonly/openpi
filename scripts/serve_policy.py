@@ -76,7 +76,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.SPIRITAI: Checkpoint(
         config="pi05_spiritai_lora",
-        dir="checkpoints/pi05_spiritai_lora/20260512_FoldPaperBox_350ep_34000stp/15000",
+        dir="checkpoints/pi05_spiritai_lora/20260512_FoldPaperBox_350ep_34000stp/33999",
     ),
 }
 

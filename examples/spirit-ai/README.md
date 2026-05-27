@@ -281,142 +281,297 @@ result = client.infer(example)
 print("Actions shape:", result["actions"].shape)  # (10, 27)
 ```
 
-## Step 7: Real Robot Inference
+## Step 7: Real Robot Inference via Thor robot_server
 
-This step runs the full closed-loop inference: Policy Server on GPU ↔ Moz1 robot via SDK + network.
-
-### Architecture
+The default real robot path is now split across two machines:
 
 ```
-GPU Server (serve_policy.py)
-   ↕ WebSocket :8000
-Robot Control Machine (main.py)
-   ├── Moz SDK → capture_observation() → send_action()
-   ↕ ROS2 / CycloneDDS (network cable)
-Moz1 Robot (172.16.0.30)
+Precision / GPU machine
+  serve_policy.py             ws://localhost:8000
+  examples/spirit-ai/main.py  bridge client
+        |
+        | WebSocket ws://THOR_IP:8766
+        v
+Thor / Jetson robot machine
+  robot_server Docker container
+        |
+        | pymozrobot + GMSL + ROS2
+        v
+  MOZ1 robot + GMSL cameras
 ```
 
-*If the GPU server and robot control machine are the same host*, use `--args.host localhost`.
+`examples/spirit-ai/main.py` no longer talks to RealSense, ROS2, or the robot SDK directly. It only bridges the local policy server and the remote `robot_server`. The old SDK environment remains in [`env.py`](env.py) for reference and legacy manual use.
 
-### 7a. Prerequisites
+### 7a. Start robot_server on Thor
 
-1. **Install Moz Robot SDK** (`mozrobot` wheel)
-2. **Install openpi-client** (Step 6) and additional dependencies:
+On Thor, import the robot image and start the long-running container:
 
 ```bash
-pip install scipy tyro typing_extensions -i https://pypi.tuna.tsinghua.edu.cn/simple/ --trusted-host pypi.tuna.tsinghua.edu.cn
+sudo docker load -i /home/dengkevin/Documents/code/thor_robot_image/thor-robot_image.tar
+sudo docker images | grep thor-robot
+
+cd /home/dengkevin/Documents/code/robot_server_code
+sudo bash run_robot.sh
+sudo docker logs -f robot_server
 ```
 
-3. **Set PYTHONPATH** (required for both `openpi_client` and the spirit-ai example):
+The logs should show the robot structure, GMSL camera readiness, and a WebSocket listener such as `ws://0.0.0.0:8766`.
+
+Find the Thor IP that the Precision/GPU machine can reach:
 
 ```bash
-export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH
+ip addr
 ```
 
-4. **ROS2 environment** (required by Moz SDK):
+### 7b. Validate robot_server from Precision
+
+From the Precision/GPU machine:
 
 ```bash
-source /opt/ros/humble/setup.bash
+ping THOR_IP
+nc -vz THOR_IP 8766
+
+cd /home/dengkevin/Documents/code/robot_server_code
+python test_connect.py --url ws://THOR_IP:8766
 ```
 
-5. **Network configuration** — see 7c below.
+For the current Thor setup, the expected metadata is:
 
-### 7b. Run
+| Field | Value |
+|-------|-------|
+| `structure` | `wholebody` |
+| `joint_dim` | `25` |
+| `accepted_joint_dims` | `[16, 22, 25]` |
+| required cameras | `cam_high`, `cam_left_wrist`, `cam_right_wrist` |
 
-Terminal 1 — Start Policy Server (in `uv` managed environment):
+Extra cameras such as `cam_high_extra`, `cam_left_wrist_extra`, and `cam_right_wrist_extra` are ignored by the policy bridge.
+
+### 7c. Start the policy server on Precision
 
 ```bash
+cd /home/dengkevin/Documents/code/openpi
 uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "fold the paper box"
 ```
 
-Terminal 2 — Start Robot Client (in system Python with ROS2):
+Optional policy-only smoke test:
 
 ```bash
-export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH
-source /opt/ros/humble/setup.bash
+uv run python - <<'PY'
+from openpi.policies.spiritai_policy import make_spiritai_example
+from openpi_client import websocket_client_policy
 
-python3 examples/spirit-ai/main.py \
-    --args.host localhost \
-    --args.prompt "fold the paper box"
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+res = client.infer(make_spiritai_example())
+print(res["actions"].shape)
+PY
 ```
 
-All CLI parameters (use `--args.<field>` prefix):
+Expected output:
+
+```text
+(10, 27)
+```
+
+### 7d. Run the bridge
+
+Start with a short run:
+
+```bash
+cd /home/dengkevin/Documents/code/openpi
+uv run python examples/spirit-ai/main.py \
+    --policy-host localhost \
+    --policy-port 8000 \
+    --robot-url ws://THOR_IP:8766 \
+    --prompt "fold the paper box" \
+    --enable-external-following \
+    --startup-delay-s 10 \
+    --source-hz 15 \
+    --blend-steps 4 \
+    --rollback-guard-steps 4 \
+    --rollback-scale 0.2 \
+    --max-arm-velocity-rad-s 0.35 \
+    --max-torso-velocity-rad-s 0.2 \
+    --max-gripper-velocity-s 0.8 \
+    --max-base-speed 0.05 \
+    --prefetch-next-chunk \
+    --prefetch-delay-fraction 0.85 \
+    --max-steps 5
+```
+
+If `robot_server` accepts the chunks and the robot feedback looks correct, increase `--max-steps` gradually.
+
+CLI parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--args.host` | `0.0.0.0` | Policy Server IP (`localhost` if same machine) |
-| `--args.port` | `8000` | Policy Server port |
-| `--args.realsense_serials` | `230322270398,313522302626,230422271253` | Camera serial numbers (comma-separated) |
-| `--args.camera_resolutions` | `320*240,320*240,320*240` | Camera resolutions |
-| `--args.structure` | `wholebody` | Robot structure (`wholebody` / `wholebody_without_base` / `dualarm`) |
-| `--args.prompt` | `fold the paper box` | Task instruction (should match server's `--default_prompt`) |
-| `--args.action_horizon` | `40` | Steps per inference cycle (10 model steps × 4x resample) |
-| `--args.resample_ratio` | `4.0` | Resample from model Hz to 120Hz control |
-| `--args.num_episodes` | `1` | Number of episodes |
-| `--args.max_episode_steps` | `2000` | Max steps per episode |
+| `--policy-host` | `localhost` | Policy server host |
+| `--policy-port` | `8000` | Policy server port |
+| `--robot-url` | `ws://172.16.0.30:8766` | Thor `robot_server` WebSocket URL |
+| `--prompt` | `fold the paper box` | Task instruction; keep aligned with policy server `--default_prompt` |
+| `--max-steps` | `2000` | Number of policy chunks to send |
+| `--source-hz` | `15.0` | Source action chunk frequency sent to `robot_server` |
+| `--busy-sleep-s` | `0.01` | Poll interval while waiting for `robot_server` to become idle |
+| `--startup-delay-s` | `10.0` | Delay after both servers connect and before the first inference/action chunk |
+| `--enable-external-following` | `False` | Ask `robot_server` to enable arm external following mode before inference |
+| `--blend-steps` | `4` | Align the first command to current state and blend this many chunk-start frames |
+| `--rollback-guard-steps` | `4` | Suppress arm/torso rollback over this many chunk-start frames |
+| `--rollback-scale` | `0.2` | Fraction of detected rollback to keep during guarded chunk-start frames |
+| `--prefetch-next-chunk` | `True` | Run next policy inference while the current chunk is executing |
+| `--prefetch-delay-fraction` | `0.5` | Fraction of remaining chunk execution time to wait before prefetching the next observation |
+| `--max-arm-velocity-rad-s` | `0.35` | Max adjacent-frame arm joint velocity before sending to `robot_server` |
+| `--max-torso-velocity-rad-s` | `0.2` | Max adjacent-frame torso joint velocity before sending to `robot_server` |
+| `--max-gripper-velocity-s` | `0.8` | Max adjacent-frame gripper command velocity before sending to `robot_server` |
+| `--max-base-speed` | `0.05` | Absolute clamp for base speed command dims |
+| `--max-joint-accel-rad-s2` | `0.0` | Optional adjacent-frame acceleration limit; `0.0` disables it |
 
-### 7c. Network Configuration (CycloneDDS)
+### 7e. Bridge action layout
 
-The Moz SDK uses CycloneDDS (ROS2 middleware) to communicate with the robot. A `cyclonedds.xml` configuration file is required. Example at `/path/to/mozrobot-0.1.3/cyclonedds.xml`.
+The policy returns `(10, 27)` in SpiritAI layout:
 
-**Critical**: The `NetworkInterfaceAddress` must match **your server's IP** on the robot subnet, NOT the robot's IP.
-
-```xml
-<General>
-    <!-- This must be YOUR machine's IP on the 172.16.0.x subnet -->
-    <NetworkInterfaceAddress>172.16.0.50</NetworkInterfaceAddress>
-    <AllowMulticast>false</AllowMulticast>
-</General>
-<Discovery>
-    <Peers>
-        <Peer address="172.16.0.30"/>  <!-- Robot controller IP -->
-        <Peer address="127.0.0.1"/>     <!-- Local loopback -->
-    </Peers>
-</Discovery>
+```text
+[left_joints(7), left_psi(1), left_gripper(1),
+ right_joints(7), right_psi(1), right_gripper(1),
+ torso_joints(6), base_speed(3)]
 ```
 
-To find your machine's IP on the robot subnet:
+`robot_server` joint commands do not include psi. The bridge chooses the widest supported joint command from metadata:
 
-```bash
-ip addr | grep "172.16"
-```
+| Command dim | Layout |
+|-------------|--------|
+| `25` | `left_joints(7), left_gripper(1), right_joints(7), right_gripper(1), torso_joints(6), base_speed(3)` |
+| `22` | same as 25D, without `base_speed(3)` |
+| `16` | arms and grippers only |
 
-> **Common error**: `does not match an available interface` — means `NetworkInterfaceAddress` is wrong. Update it to your actual IP.
+For the current Thor metadata (`joint_dim=25`, `accepted_joint_dims=[16, 22, 25]`), the bridge sends 25D joint commands.
 
-### 7d. How It Works
-
-The inference loop runs at 120Hz:
-
-1. **`env.get_observation()`** — Reads robot state + cameras via Moz SDK, adds `prompt`
-2. **`ActionChunkResampleBroker.infer()`** — Sends observation to Policy Server via WebSocket, receives `(10, 27)` action chunk
-3. **Split + Resample** — The 27-dim flat action is split into 8 named keys, then resampled from ~30Hz to 120Hz via PchipInterpolator (4x ratio → 40 control steps)
-4. **`env.apply_action()`** — Each resampled step is sent to the robot as `send_action()` at 120Hz
-5. After 40 steps, triggers next inference → repeat
-
-**Data flow**:
-
-```
-Policy Server returns: {"actions": (10, 27)}
-  ↓ split_actions()
-  {"leftarm_cmd_joint_pos": (10,7), "leftarm_cmd_psi": (10,1), ..., "base_cmd_speed": (10,3)}
-  ↓ _resample_action (4x interpolation)
-  List of 40 dicts, each with named keys matching SDK send_action format
-  ↓ robot.send_action() @ 120Hz
-  Robot executes actions
-```
-
-**Psi handling**: Currently `leftarm_state_psi` and `rightarm_state_psi` are set to `np.zeros(1)` in `env.py`. Update if your model requires actual psi values.
-
-### 7e. Troubleshooting
+### 7f. Troubleshooting
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `does not match an available interface` | `cyclonedds.xml` NetworkInterfaceAddress wrong | Update to your server's IP on 172.16.0.x subnet |
-| `No device connected` (camera) | RealSense cameras not plugged in or wrong serials | Check `rs-enumerate-devices`, verify serial numbers |
-| `rcl node's rmw handle is invalid` | ROS2 DDS can't reach robot | Check network, verify `cyclonedds.xml`, ensure `source /opt/ros/humble/setup.bash` |
-| `ModuleNotFoundError: No module named 'openpi_client'` | PYTHONPATH not set | `export PYTHONPATH=$(pwd):$(pwd)/packages/openpi-client/src:$PYTHONPATH` |
-| `Unrecognized options: --host` | tyro requires nested prefix | Use `--args.host` instead of `--host` |
-| `ConnectionRefusedError` | Policy Server not running | Start server first: `uv run scripts/serve_policy.py --env SPIRITAI` |
+| `ConnectionRefusedError` from policy client | Policy server not running | Start `uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "fold the paper box"` |
+| `robot_server is missing required cameras` | Camera names do not include policy keys | Check `test_connect.py` output and `run_robot.sh --camera-names` |
+| `Unsupported robot_server joint metadata` | Server does not accept 16D/22D/25D joint commands | Check `accepted_joint_dims` from `test_connect.py` |
+| `accepted: false` ack | Server is busy or rejected the chunk | Check `docker logs -f robot_server`; reduce load and retry |
+| `ModuleNotFoundError: No module named 'openpi_client'` | Environment is missing workspace package | Run through `uv run` from the openpi repo root |
+
+### 7g. Current Real Robot Deployment Notes
+
+This section summarizes the current Thor `robot_server` deployment work and the latest motion tuning observations.
+
+#### Deployment status
+
+- Thor `robot_server` is running in Docker and listening on `ws://172.16.0.30:8766`.
+- Precision connects to the local policy server at `localhost:8000` and bridges actions to Thor through [`main.py`](main.py).
+- The current Thor metadata is `structure=wholebody`, `joint_dim=25`, and `accepted_joint_dims=[16, 22, 25]`.
+- External following must be enabled before real motion. Use `--enable-external-following`; without it, the server accepts commands but arm joint states do not meaningfully follow.
+- The bridge sends 25D joint commands in this layout:
+
+```text
+[left_joints(7), left_gripper(1),
+ right_joints(7), right_gripper(1),
+ torso_joints(6), base_speed(3)]
+```
+
+#### Work completed so far
+
+- Replaced the old direct SDK/RealSense real robot entry path with a two-machine bridge.
+- Added protocol support to request external following mode through `robot_server`.
+- Added chunk-start smoothing:
+  - `--blend-steps`
+  - `--rollback-guard-steps`
+  - `--rollback-scale`
+- Added Precision-side motion limiting before sending commands to Thor:
+  - `--max-arm-velocity-rad-s`
+  - `--max-torso-velocity-rad-s`
+  - `--max-gripper-velocity-s`
+  - `--max-base-speed`
+  - `--max-joint-accel-rad-s2`
+- Added per-step logs for:
+  - actual state delta since the previous chunk
+  - command first-frame delta by group
+  - raw vs limited max velocity
+  - `limited_fraction`
+
+#### Important behavior found during testing
+
+The robot now moves reliably with external following enabled, but the latest real robot tests show a tradeoff:
+
+- Strong velocity limiting reduces visible shaking.
+- Strong velocity limiting also makes the executed path differ from the policy output, which can reduce continuity and task progress.
+- `--prefetch-next-chunk` reduces waiting between chunks, but it can use an observation captured before the robot reaches the end of the current chunk. If the next policy output is based on that stale observation, the next chunk can fight the actual robot state.
+- `--no-prefetch-next-chunk` made the motion slightly less shaky in testing, but continuity became worse because every chunk waits for the previous chunk to finish before doing the next policy call.
+- Lowering `source_hz` slows the same 10-frame action chunk down. This can reduce speed-related shaking, but it also increases task latency.
+- Increasing `source_hz` may improve responsiveness and training-frequency match, but it can increase chunk turnover and make boundary artifacts more visible unless the command path is smooth enough.
+
+#### Recent benchmark observations
+
+Manual scores from recent tests:
+
+| Setting | Jitter | Continuity | Task intent | Notes |
+|---------|--------|------------|-------------|-------|
+| `source_hz=15`, `arm=0.28`, `torso=0.15`, `accel=0.8`, prefetch `0.85` | noticeable shake | medium-low | good | `limited_fraction` often around `0.45-0.60` |
+| Same, prefetch `0.1` | worse shake | poor | unstable | prefetch likely too early; stale observation effect |
+| Same, `--no-prefetch-next-chunk` | slightly less shake | poor | acceptable | less stale observation, but chunk-to-chunk waiting hurts continuity |
+
+Earlier coarse benchmark trend:
+
+| Variable | Observed trend |
+|----------|----------------|
+| Lower velocity | less shaking, but too low can make motion slow and discontinuous |
+| Higher velocity | more responsive, but shaking returns more easily |
+| `accel=0.0` | least shaking in earlier notes, but continuity was worse |
+| `accel=0.8-1.2` | better continuity, slightly more shaking |
+| `source_hz=12` | more continuous but weaker task intent |
+| `source_hz=15` | best balance seen so far |
+| `source_hz=20` | more responsive but can shake more |
+
+#### Current interpretation
+
+The remaining issue is probably not one single parameter. The likely causes are:
+
+1. **Policy output is still high-velocity relative to safe real robot execution.** Logs often show `raw_max_vel` much larger than `limited_max_vel`.
+2. **The limiter is changing a large fraction of the output.** `limited_fraction` around `0.45-0.60` means the executed trajectory is materially different from the model output.
+3. **Chunk-level control is fighting continuous motion.** Each 10-frame policy chunk is smoothed locally, but there is no global continuous trajectory optimizer across chunks.
+4. **Prefetch is a tradeoff, not a clear win.** Early prefetch can be stale; no prefetch adds inference gaps.
+5. **Thor-side interpolation is still PCHIP per chunk.** It upsamples each received chunk to 120Hz, but it does not enforce global velocity, acceleration, or jerk continuity across chunk boundaries.
+
+#### Recommended pause point
+
+Do not keep increasing `--max-steps` until the short-run behavior is understood. Use `--max-steps 5` or `10` for further experiments.
+
+The current safest reference command for analysis is:
+
+```bash
+uv run python examples/spirit-ai/main.py \
+  --policy-host localhost \
+  --policy-port 8000 \
+  --robot-url ws://172.16.0.30:8766 \
+  --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps" \
+  --enable-external-following \
+  --startup-delay-s 10 \
+  --source-hz 15 \
+  --blend-steps 4 \
+  --rollback-guard-steps 4 \
+  --rollback-scale 0.2 \
+  --max-arm-velocity-rad-s 0.28 \
+  --max-torso-velocity-rad-s 0.15 \
+  --max-gripper-velocity-s 0.8 \
+  --max-base-speed 0.05 \
+  --max-joint-accel-rad-s2 0.8 \
+  --no-prefetch-next-chunk \
+  --max-steps 10
+```
+
+Use [`motion_benchmark_plan.md`](motion_benchmark_plan.md) for the full benchmark matrix.
+
+#### Likely next engineering step
+
+Parameter tuning alone is reaching diminishing returns. The next code-level improvement should be one of:
+
+- Add a cross-chunk trajectory buffer that blends from the currently executing tail into the next policy chunk instead of sending independent chunks.
+- Move velocity/acceleration/jerk limiting to Thor after PCHIP resampling, so the final 120Hz command stream is globally limited.
+- Add log metrics for policy inference latency, chunk idle time, and boundary discontinuity between previous chunk tail and new chunk head.
+- Compare against a recorded human/demo joint trajectory replay through the same `robot_server` path. If replay is smooth but policy is not, the issue is mostly policy output/noise. If replay also shakes, the issue is lower in the robot command/interpolation path.
 
 ## Architecture Reference
 
@@ -426,11 +581,11 @@ Policy Server returns: {"actions": (10, 27)}
 |------|---------|
 | [`scripts/serve_policy.py`](../../scripts/serve_policy.py) | Policy server with `SPIRITAI` env mode and `DEFAULT_CHECKPOINT` |
 | [`src/openpi/policies/spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) | Input/output transforms (`SpiritaiInputs`, `SpiritaiOutputs`) |
+| [`src/openpi/policies/spiritai_bridge.py`](../../src/openpi/policies/spiritai_bridge.py) | `robot_server` observation mapping, metadata handling, msgpack codec, and 27D→joint command conversion |
 | [`src/openpi/training/config.py`](../../src/openpi/training/config.py) | `LeRobotSpiritaiDataConfig` and `pi05_spiritai_lora` TrainConfig |
 | [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
-| [`examples/spirit-ai/main.py`](main.py) | Real robot inference entry point |
-| [`examples/spirit-ai/env.py`](env.py) | MOZ1 robot environment (SDK → observation/action) |
-| [`packages/openpi-client/src/openpi_client/action_chunk_resample_broker.py`](../../packages/openpi-client/src/openpi_client/action_chunk_resample_broker.py) | Action chunk splitting (27→8 keys) + 30Hz→120Hz resampling |
+| [`examples/spirit-ai/main.py`](main.py) | Default real robot bridge entry point for Precision policy server ↔ Thor `robot_server` |
+| [`examples/spirit-ai/env.py`](env.py) | Legacy direct MOZ1 SDK environment kept for reference |
 
 ### Data Flow
 
@@ -438,6 +593,7 @@ Policy Server returns: {"actions": (10, 27)}
 2. **`SpiritaiInputs`** concatenates the 8 absolute state columns into a 27-dim `state` vector, parses 3 camera images, and concatenates raw `*_cmd_*` action columns into a 27-dim `actions` vector
 3. **Model transforms** pad state/actions to 32 dims (π0.5's `action_dim`), resize images to 224×224, tokenize the prompt
 4. **`SpiritaiOutputs`** slices the first 27 dims from the padded 32-dim model output
+5. **`spiritai_bridge.py`** drops the two psi command dimensions and sends 25D, 22D, or 16D joint commands according to `robot_server` metadata
 
 ### Training Config
 
