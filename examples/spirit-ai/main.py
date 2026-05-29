@@ -136,10 +136,14 @@ def main(args: Args) -> None:
                 )
 
             if prefetched_actions is None:
+                inference_start_s = time.perf_counter()
                 raw_actions = _infer_policy_actions(policy, obs, images, prompt=args.prompt)
+                inference_latency_s = time.perf_counter() - inference_start_s
+                logging.info("Step %d policy inference latency: %.3fs", step, inference_latency_s)
             else:
                 raw_actions = prefetched_actions
                 prefetched_actions = None
+                logging.info("Step %d using prefetched policy actions", step)
 
             joint_commands = spiritai_bridge.spiritai_actions_to_joint_commands(raw_actions, joint_command_dim)
             if joint_commands.shape[0] > max_chunk:
@@ -220,8 +224,10 @@ def main(args: Args) -> None:
                     if delay_s > 0:
                         time.sleep(delay_s)
                 prefetch_obs, prefetch_images = _get_robot_obs(robot_ws)
+                prefetch_start_s = time.perf_counter()
                 prefetched_actions = _infer_policy_actions(policy, prefetch_obs, prefetch_images, prompt=args.prompt)
-                logging.info("Step %d prefetched next policy chunk", step)
+                prefetch_latency_s = time.perf_counter() - prefetch_start_s
+                logging.info("Step %d prefetch policy inference latency: %.3fs", step, prefetch_latency_s)
 
 
 if __name__ == "__main__":
