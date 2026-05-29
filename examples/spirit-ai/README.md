@@ -20,6 +20,13 @@ The Spirit AI moz1 robot has:
 
 Action keys follow the same layout but use `_cmd_` instead of `_state_` (e.g. `leftarm_cmd_joint_pos`).
 
+This repo also includes a Cartesian-action fine-tuning config. In that variant, the left/right arm joint vectors are replaced with 6D Cartesian pose vectors:
+
+| Variant | Arm command keys | Real action dims | Padded model dims |
+|---------|------------------|------------------|-------------------|
+| Joint baseline | `leftarm_cmd_joint_pos`, `rightarm_cmd_joint_pos` | 27 | 32 |
+| Cartesian h30 | `leftarm_cmd_cart_pos`, `rightarm_cmd_cart_pos` | 25 | 32 |
+
 Cameras: `cam_high` (overhead), `cam_left_wrist`, `cam_right_wrist`.
 
 ## Prerequisites
@@ -85,12 +92,34 @@ data=LeRobotSpiritaiDataConfig(
 ),
 ```
 
+For the Cartesian h30 config used by `20260424_FoldPaperBox_Moz1WB_Slice_repaired`, the local symlink should be:
+
+```bash
+mkdir -p ~/.cache/huggingface/lerobot/spiritai
+ln -sfn /home/deng/Documents/dataset/20260424_FoldPaperBox_Moz1WB_Slice_repaired \
+    ~/.cache/huggingface/lerobot/spiritai/20260424_FoldPaperBox_Moz1WB_Slice_repaired
+```
+
+The matching training config is `pi05_spiritai_cart_lora_h30`.
+
 > **Note:** The `repo_id` becomes part of the norm_stats storage path under `assets/`. A `repo_id` with a `/` creates nested subdirectories (e.g. `assets/pi05_spiritai_lora/spiritai/your_dataset_name/norm_stats.json`). If you prefer a flatter path, use a `repo_id` without `/` (e.g. `"spiritai_your_dataset_name"`) and place the symlink directly at `~/.cache/huggingface/lerobot/spiritai_your_dataset_name`.
 
 ## Step 3: Compute Normalization Statistics
 
 ```bash
 uv run python scripts/compute_norm_stats.py --config-name pi05_spiritai_lora
+```
+
+For the Cartesian h30 config, you can reuse Cartesian norm stats computed for the same dataset because the per-dimension state/action statistics do not depend on `action_horizon`. One practical option is to symlink the old h50 stats directory:
+
+```bash
+ln -sfn pi05_spiritai_cart_lora_h50 assets/pi05_spiritai_cart_lora_h30
+```
+
+If you need to recompute them from scratch for the h30 config, run:
+
+```bash
+uv run python scripts/compute_norm_stats.py --config-name pi05_spiritai_cart_lora_h30
 ```
 
 This writes `norm_stats.json` to `./assets/pi05_spiritai_lora/<repo_id>/`. The output path is determined by `config.assets_dirs / data_config.repo_id`, where `assets_dirs` resolves to `./assets/<config_name>` (i.e. `./assets/pi05_spiritai_lora`) and `repo_id` comes from your `LeRobotSpiritaiDataConfig`. Make sure to run this command from the repo root so that `./assets` resolves correctly.
@@ -138,6 +167,31 @@ uv run python scripts/train.py pi05_spiritai_lora \
     --log_interval 10
 ```
 
+Cartesian h30 smoke test:
+
+```bash
+uv run python scripts/train.py pi05_spiritai_cart_lora_h30 \
+    --num_train_steps 10 \
+    --batch_size 16 \
+    --exp_name smoke_cart_h30 \
+    --overwrite \
+    --no-wandb_enabled \
+    --save_interval 10 \
+    --log_interval 1
+```
+
+Cartesian h30 full training:
+
+```bash
+uv run python scripts/train.py pi05_spiritai_cart_lora_h30 \
+    --num_train_steps 12000 \
+    --batch_size 16 \
+    --exp_name 20260424_FoldPaperBox_cart_h30_12000stp \
+    --overwrite \
+    --save_interval 2000 \
+    --log_interval 100
+```
+
 Checkpoints are saved to `checkpoints/pi05_spiritai_lora/<exp_name>/`.
 
 ### 4a. Fine-tuning parameters and action horizon
@@ -160,6 +214,14 @@ For the current checkpoint, `action_horizon=10`, so the policy returns:
 ```text
 (10, 27)
 ```
+
+The Cartesian config `pi05_spiritai_cart_lora_h30` uses `action_horizon=30` and returns:
+
+```text
+(30, 25)
+```
+
+Those 25 values are Cartesian command-space values, not joint commands. For real-robot deployment, run the bridge with `--policy-action-layout cartesian` so it sends `kind="cart"` commands to `robot_server`.
 
 The model architecture can support longer horizons. For example, π0 configs commonly use larger horizons, and `sample_actions()` generates tensors shaped by the configured `model.action_horizon`. However, a checkpoint trained with `action_horizon=10` should be treated as a 10-frame policy. Do not simply change the inference config to `30` and expect the existing checkpoint to produce reliable 30-frame behavior; the extra horizon would be outside the training distribution.
 
@@ -189,12 +251,15 @@ Recommended horizon experiment order:
 | `16` | First longer-horizon experiment | Moderate open-loop drift |
 | `20` | Good candidate for reducing chunk-boundary artifacts | More open-loop execution |
 | `30` | Only after 16/20 work well | Long open-loop duration; higher contact-task risk |
+| `50` | Long-context Cartesian experiment; execute only a prefix | Very long open-loop if all frames are executed |
 
 Longer horizon is not automatically better. At `source_hz=15`, a 10-frame chunk lasts about `9/15 = 0.6s`, while a 30-frame chunk lasts about `29/15 = 1.93s`. Fewer policy calls can improve continuity, but the robot also runs longer without fresh image feedback. For contact-rich tasks such as folding a paper box, a good deployment pattern is usually:
 
 ```text
 predict 16-20 frames, execute only the first 6-10 frames, then replan
 ```
+
+For `action_horizon=30`, the full chunk is about `29/15 = 1.93s` at `source_hz=15`. The recommended deployment pattern is to predict 30 frames but execute only the first 15-20 frames before replanning.
 
 This receding-horizon setup keeps some future context while avoiding a long open-loop rollout.
 
@@ -228,6 +293,15 @@ uv run scripts/serve_policy.py policy:checkpoint \
     --policy.config pi05_spiritai_lora \
     --policy.dir checkpoints/pi05_spiritai_lora/<exp_name>/<step> \
     --default_prompt "fold the paper box"
+```
+
+For a Cartesian h30 checkpoint:
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config pi05_spiritai_cart_lora_h30 \
+    --policy.dir checkpoints/pi05_spiritai_cart_lora_h30/<exp_name>/<step> \
+    --default_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps"
 ```
 
 For example:
@@ -335,6 +409,32 @@ The returned `action_chunk` has shape `(action_horizon, 27)` where `action_horiz
 | 18–23 | Torso joint commands |
 | 24–26 | Base speed commands |
 
+For `pi05_spiritai_cart_lora_h30`, the Python client observation must use Cartesian state keys instead of joint state keys:
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `leftarm_state_cart_pos` | `float32` ndarray | `(6,)` | Left arm Cartesian pose |
+| `leftarm_state_psi` | `float32` ndarray | `(1,)` | Left arm psi |
+| `leftarm_gripper_state_pos` | `float32` ndarray | `(1,)` | Left gripper position |
+| `rightarm_state_cart_pos` | `float32` ndarray | `(6,)` | Right arm Cartesian pose |
+| `rightarm_state_psi` | `float32` ndarray | `(1,)` | Right arm psi |
+| `rightarm_gripper_state_pos` | `float32` ndarray | `(1,)` | Right gripper position |
+| `torso_state_cart_pos` | `float32` ndarray | `(6,)` | Torso Cartesian pose |
+| `base_state_speed` | `float32` ndarray | `(3,)` | Base speed |
+
+The Cartesian policy returns `(30, 25)`:
+
+| Dims | Description |
+|------|-------------|
+| 0–5 | Left arm Cartesian command |
+| 6 | Left arm psi command |
+| 7 | Left gripper command |
+| 8–13 | Right arm Cartesian command |
+| 14 | Right arm psi command |
+| 15 | Right gripper command |
+| 16–21 | Torso Cartesian command |
+| 22–24 | Base speed command |
+
 ### Action semantics
 
 For the current `pi05_spiritai_lora` config, `extra_delta_transform=False`. This means openpi does **not** convert the dataset actions into `cmd - state` deltas during training, and it does **not** add the current state back to the predicted actions during inference.
@@ -364,6 +464,18 @@ client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=80
 example = make_spiritai_example()
 result = client.infer(example)
 print("Actions shape:", result["actions"].shape)  # (10, 27)
+```
+
+For the Cartesian h30 config:
+
+```python
+from openpi.policies.spiritai_policy import make_spiritai_cartesian_example
+from openpi_client import websocket_client_policy
+
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+example = make_spiritai_cartesian_example()
+result = client.infer(example)
+print("Actions shape:", result["actions"].shape)  # (30, 25)
 ```
 
 ## Step 7: Real Robot Inference via Thor robot_server
@@ -426,7 +538,9 @@ For the current Thor setup, the expected metadata is:
 |-------|-------|
 | `structure` | `wholebody` |
 | `joint_dim` | `25` |
+| `cart_dim` | `23` |
 | `accepted_joint_dims` | `[16, 22, 25]` |
+| `accepted_cart_dims` | `[14, 20, 23]` |
 | required cameras | `cam_high`, `cam_left_wrist`, `cam_right_wrist` |
 
 Extra cameras such as `cam_high_extra`, `cam_left_wrist_extra`, and `cam_right_wrist_extra` are ignored by the policy bridge.
@@ -457,6 +571,34 @@ Expected output:
 (10, 27)
 ```
 
+For a Cartesian h30 checkpoint:
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config pi05_spiritai_cart_lora_h30 \
+    --policy.dir checkpoints/pi05_spiritai_cart_lora_h30/<exp_name>/<step> \
+    --default_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps"
+```
+
+Cartesian policy-only smoke test:
+
+```bash
+uv run python - <<'PY'
+from openpi.policies.spiritai_policy import make_spiritai_cartesian_example
+from openpi_client import websocket_client_policy
+
+client = websocket_client_policy.WebsocketClientPolicy(host="localhost", port=8000)
+res = client.infer(make_spiritai_cartesian_example())
+print(res["actions"].shape)
+PY
+```
+
+Expected output:
+
+```text
+(30, 25)
+```
+
 ### 7d. Run the bridge
 
 Start with a short run:
@@ -485,6 +627,41 @@ uv run python examples/spirit-ai/main.py \
 
 If `robot_server` accepts the chunks and the robot feedback looks correct, increase `--max-steps` gradually.
 
+For a Cartesian h30 checkpoint, use the Cartesian bridge path. Start with a short, conservative run and execute only the first 15 frames from each 30-frame policy chunk:
+
+```bash
+cd /home/dengkevin/Documents/code/openpi
+uv run python examples/spirit-ai/main.py \
+    --policy-host localhost \
+    --policy-port 8000 \
+    --robot-url ws://THOR_IP:8766 \
+    --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps" \
+    --policy-action-layout cartesian \
+    --execute-steps 15 \
+    --enable-external-following \
+    --startup-delay-s 10 \
+    --source-hz 15 \
+    --blend-steps 4 \
+    --rollback-guard-steps 4 \
+    --rollback-scale 0.2 \
+    --max-cart-translation-m-s 0.08 \
+    --max-cart-rotation-rad-s 0.35 \
+    --max-torso-cart-translation-m-s 0.04 \
+    --max-torso-cart-rotation-rad-s 0.2 \
+    --max-gripper-velocity-s 0.8 \
+    --max-base-speed 0.05 \
+    --no-prefetch-next-chunk \
+    --max-steps 3
+```
+
+In Cartesian mode, `main.py` maps robot observations with Cartesian state keys, converts the policy's `(30, 25)` action chunk to robot_server Cartesian commands, and sends:
+
+```python
+{"kind": "cart", "actions": cart_commands}
+```
+
+For a wholebody robot with `cart_dim=23`, `--execute-steps 15` sends `(15, 23)` to `robot_server`.
+
 CLI parameters:
 
 | Parameter | Default | Description |
@@ -494,6 +671,8 @@ CLI parameters:
 | `--robot-url` | `ws://172.16.0.30:8766` | Thor `robot_server` WebSocket URL |
 | `--prompt` | `fold the paper box` | Task instruction; keep aligned with policy server `--default_prompt` |
 | `--max-steps` | `2000` | Number of policy chunks to send |
+| `--policy-action-layout` | `joint` | `joint` for 27D joint policy outputs, `cartesian` for 25D Cartesian policy outputs |
+| `--execute-steps` | `None` | Optional prefix length to execute from each policy chunk; use `15` or `20` for Cartesian h30 |
 | `--source-hz` | `15.0` | Source action chunk frequency sent to `robot_server` |
 | `--busy-sleep-s` | `0.01` | Poll interval while waiting for `robot_server` to become idle |
 | `--startup-delay-s` | `10.0` | Delay after both servers connect and before the first inference/action chunk |
@@ -508,6 +687,11 @@ CLI parameters:
 | `--max-gripper-velocity-s` | `0.8` | Max adjacent-frame gripper command velocity before sending to `robot_server` |
 | `--max-base-speed` | `0.05` | Absolute clamp for base speed command dims |
 | `--max-joint-accel-rad-s2` | `0.0` | Optional adjacent-frame acceleration limit; `0.0` disables it |
+| `--max-cart-translation-m-s` | `0.08` | Max adjacent-frame arm Cartesian translation velocity in Cartesian mode |
+| `--max-cart-rotation-rad-s` | `0.35` | Max adjacent-frame arm Cartesian rotation-vector velocity in Cartesian mode |
+| `--max-torso-cart-translation-m-s` | `0.04` | Max adjacent-frame torso Cartesian translation velocity in Cartesian mode |
+| `--max-torso-cart-rotation-rad-s` | `0.2` | Max adjacent-frame torso Cartesian rotation-vector velocity in Cartesian mode |
+| `--max-cart-accel` | `0.0` | Optional adjacent-frame Cartesian acceleration limit; `0.0` disables it |
 
 ### 7e. Bridge action layout
 
@@ -529,6 +713,24 @@ The policy returns `(10, 27)` in SpiritAI layout:
 
 For the current Thor metadata (`joint_dim=25`, `accepted_joint_dims=[16, 22, 25]`), the bridge sends 25D joint commands.
 
+For Cartesian h30, the policy returns `(30, 25)` in SpiritAI Cartesian layout:
+
+```text
+[left_cart(6), left_psi(1), left_gripper(1),
+ right_cart(6), right_psi(1), right_gripper(1),
+ torso_cart(6), base_speed(3)]
+```
+
+`robot_server` Cartesian commands do not include psi. The bridge chooses the widest supported Cartesian command from metadata:
+
+| Command dim | Layout |
+|-------------|--------|
+| `23` | `left_cart(6), left_gripper(1), right_cart(6), right_gripper(1), torso_cart(6), base_speed(3)` |
+| `20` | same as 23D, without `base_speed(3)` |
+| `14` | arms and grippers only |
+
+For the current Thor metadata (`cart_dim=23`, `accepted_cart_dims=[14, 20, 23]`), the bridge sends 23D Cartesian commands. With `--execute-steps 15`, the command shape is `(15, 23)`.
+
 ### 7f. Troubleshooting
 
 | Error | Cause | Fix |
@@ -536,6 +738,9 @@ For the current Thor metadata (`joint_dim=25`, `accepted_joint_dims=[16, 22, 25]
 | `ConnectionRefusedError` from policy client | Policy server not running | Start `uv run scripts/serve_policy.py --env SPIRITAI --default_prompt "fold the paper box"` |
 | `robot_server is missing required cameras` | Camera names do not include policy keys | Check `test_connect.py` output and `run_robot.sh --camera-names` |
 | `Unsupported robot_server joint metadata` | Server does not accept 16D/22D/25D joint commands | Check `accepted_joint_dims` from `test_connect.py` |
+| `Unsupported robot_server Cartesian metadata` | Server does not accept 14D/20D/23D Cartesian commands | Check `accepted_cart_dims` from `test_connect.py` |
+| `Expected Cartesian actions with shape (T, 25)` | Cartesian bridge is receiving a joint checkpoint output, or the wrong `--policy.config` is served | Serve `pi05_spiritai_cart_lora_h30` and use `--policy-action-layout cartesian` |
+| `Expected actions with shape (T, 27)` | Joint bridge is receiving a Cartesian checkpoint output | Use `--policy-action-layout cartesian` or serve a joint checkpoint |
 | `accepted: false` ack | Server is busy or rejected the chunk | Check `docker logs -f robot_server`; reduce load and retry |
 | `ModuleNotFoundError: No module named 'openpi_client'` | Environment is missing workspace package | Run through `uv run` from the openpi repo root |
 
@@ -563,7 +768,7 @@ Current short summary:
 |------|---------|
 | [`scripts/serve_policy.py`](../../scripts/serve_policy.py) | Policy server with `SPIRITAI` env mode and `DEFAULT_CHECKPOINT` |
 | [`src/openpi/policies/spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) | Input/output transforms (`SpiritaiInputs`, `SpiritaiOutputs`) |
-| [`src/openpi/policies/spiritai_bridge.py`](../../src/openpi/policies/spiritai_bridge.py) | `robot_server` observation mapping, metadata handling, msgpack codec, and 27D→joint command conversion |
+| [`src/openpi/policies/spiritai_bridge.py`](../../src/openpi/policies/spiritai_bridge.py) | `robot_server` observation mapping, metadata handling, msgpack codec, 27D→joint conversion, and 25D→Cartesian conversion |
 | [`src/openpi/training/config.py`](../../src/openpi/training/config.py) | `LeRobotSpiritaiDataConfig` and `pi05_spiritai_lora` TrainConfig |
 | [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
 | [`examples/spirit-ai/main.py`](main.py) | Default real robot bridge entry point for Precision policy server ↔ Thor `robot_server` |
@@ -579,9 +784,17 @@ Current short summary:
 4. **`SpiritaiOutputs`** slices the first 27 dims from the padded 32-dim model output
 5. **`spiritai_bridge.py`** drops the two psi command dimensions and sends 25D, 22D, or 16D joint commands according to `robot_server` metadata
 
+For the Cartesian h30 config:
+
+1. **LeRobot** creates action sequences from `*_cmd_cart_pos`, psi, gripper, and base speed columns
+2. **`SpiritaiCartesianInputs`** concatenates Cartesian state columns into a 25-dim `state` vector and Cartesian command columns into a 25-dim `actions` vector
+3. **Model transforms** pad state/actions to 32 dims
+4. **`SpiritaiCartesianOutputs`** slices the first 25 dims from the padded model output
+5. **`spiritai_bridge.py`** drops the two psi command dimensions and sends 23D, 20D, or 14D Cartesian commands according to `robot_server` metadata
+
 ### Training Config
 
-The `pi05_spiritai_lora` config fine-tunes π0.5 with LoRA adapters on both the vision-language backbone (`gemma_2b_lora`) and the action expert (`gemma_300m_lora`). Base weights are loaded from the official π0.5 checkpoint. All non-LoRA parameters are frozen.
+The `pi05_spiritai_lora` and `pi05_spiritai_cart_lora_h30` configs fine-tune π0.5 with LoRA adapters on both the vision-language backbone (`gemma_2b_lora`) and the action expert (`gemma_300m_lora`). Base weights are loaded from the official π0.5 checkpoint. All non-LoRA parameters are frozen.
 
 For action horizon and fine-tuning parameter guidance, see [Step 4a](#4a-fine-tuning-parameters-and-action-horizon).
 

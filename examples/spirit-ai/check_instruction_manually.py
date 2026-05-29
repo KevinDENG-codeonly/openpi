@@ -18,10 +18,10 @@ Usage (apply fix, write repaired copy):
         --apply
 """
 
-import json
-import shutil
 from collections import Counter
+import json
 from pathlib import Path
+import shutil
 
 import tyro
 
@@ -30,8 +30,8 @@ def _read_jsonl(path: Path) -> list[dict]:
     """Read a JSONL file and return a list of dicts."""
     items = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+        for raw_line in f:
+            line = raw_line.strip()
             if line:
                 items.append(json.loads(line))
     return items
@@ -68,7 +68,8 @@ def _check_tasks(tasks: list[dict], default_prompt: str) -> dict:
 
 def _extract_subtask_segments(episode: dict) -> list[dict]:
     """Return subtask labeling segments from an episode, if present."""
-    annotation_data = episode.get("annotation", {}).get("annotation_data", {})
+    annotation = episode.get("annotation") or {}
+    annotation_data = annotation.get("annotation_data") or {}
     segments = annotation_data.get("data")
     return segments if isinstance(segments, list) else []
 
@@ -82,7 +83,8 @@ def _check_subtask_labeling(episodes: list[dict]) -> dict:
     version_counts = Counter()
 
     for episode in episodes:
-        annotation_data = episode.get("annotation", {}).get("annotation_data", {})
+        annotation = episode.get("annotation") or {}
+        annotation_data = annotation.get("annotation_data") or {}
         if annotation_data:
             version_counts[annotation_data.get("version", "unknown")] += 1
 
@@ -164,7 +166,7 @@ def _fix_episodes(episodes: list[dict], default_prompt: str) -> list[dict]:
             new_ep["tasks"] = [default_prompt]
         # Fix the task_id_map field
         if "task_id_map" in new_ep:
-            new_ep["task_id_map"] = {k: default_prompt for k in new_ep["task_id_map"]}
+            new_ep["task_id_map"] = dict.fromkeys(new_ep["task_id_map"], default_prompt)
         fixed.append(new_ep)
     return fixed
 
@@ -229,7 +231,7 @@ def main(
 
     # --- Check tasks ---
     check = _check_tasks(tasks, default_prompt)
-    print(f"Task check results:")
+    print("Task check results:")
     print(f"  Matching:       {check['matching']}/{check['total_tasks']}")
     print(f"  Missing text:   {check['missing']}/{check['total_tasks']}")
     print(f"  Mismatched:     {check['mismatched']}/{check['total_tasks']}")
