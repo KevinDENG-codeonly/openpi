@@ -3,6 +3,7 @@ import logging
 import time
 from typing import Literal
 
+import numpy as np
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tyro
 import websockets.sync.client
@@ -38,6 +39,10 @@ class Args:
     max_torso_cart_translation_m_s: float = 0.04
     max_torso_cart_rotation_rad_s: float = 0.2
     max_cart_accel: float = 0.0
+    initial_gripper_obs_state: float = 0.0965
+    gripper_initial_tolerance: float = 0.00965
+    gripper_reset_command_state: float = 1.0
+    gripper_reset_steps: int = 10
 
 
 def _wait_until_robot_idle(robot_ws: websockets.sync.client.ClientConnection, busy_sleep_s: float) -> None:
@@ -73,6 +78,77 @@ def _set_robot_external_following(robot_ws: websockets.sync.client.ClientConnect
     logging.info("Robot external following enabled: %s", msg.get("enabled"))
 
 
+def _get_scalar_obs_value(obs: dict, key: str) -> float:
+    value = np.asarray(obs[key], dtype=np.float32).reshape(-1)
+    if value.size != 1:
+        raise spiritai_bridge.RobotServerProtocolError(f"Expected scalar obs value for {key}, got shape {value.shape}")
+    return float(value[0])
+
+
+def _get_gripper_state(obs: dict) -> tuple[float, float]:
+    return (
+        _get_scalar_obs_value(obs, "leftarm_gripper_state_pos"),
+        _get_scalar_obs_value(obs, "rightarm_gripper_state_pos"),
+    )
+
+
+def _grippers_at_initial_state(
+    obs: dict,
+    *,
+    initial_gripper_obs_state: float,
+    tolerance: float,
+) -> bool:
+    left_gripper, right_gripper = _get_gripper_state(obs)
+    return (
+        abs(left_gripper - initial_gripper_obs_state) <= tolerance
+        and abs(right_gripper - initial_gripper_obs_state) <= tolerance
+    )
+
+
+def _send_initial_gripper_reset(
+    robot_ws: websockets.sync.client.ClientConnection,
+    obs: dict,
+    *,
+    policy_action_layout: Literal["joint", "cartesian"],
+    robot_command_kind: str,
+    command_dim: int,
+    gripper_reset_command_state: float,
+    gripper_reset_steps: int,
+    source_hz: float,
+) -> None:
+    if policy_action_layout == "cartesian":
+        reset_command = spiritai_bridge.robot_server_obs_to_cartesian_command_layout(obs, command_dim)
+        command_slices = spiritai_bridge.cartesian_command_slices(command_dim)
+    else:
+        reset_command = spiritai_bridge.robot_server_obs_to_joint_command_layout(obs, command_dim)
+        command_slices = spiritai_bridge.joint_command_slices(command_dim)
+
+    reset_command = reset_command.copy()
+    reset_command[command_slices["left_gripper"]] = gripper_reset_command_state
+    reset_command[command_slices["right_gripper"]] = gripper_reset_command_state
+    reset_commands = np.repeat(reset_command[None, :], gripper_reset_steps, axis=0).astype(np.float32, copy=False)
+
+    robot_ws.send(
+        spiritai_bridge.pack_robot_server_message(
+            {
+                "type": "send_command",
+                "kind": robot_command_kind,
+                "actions": reset_commands,
+                "source_hz": source_hz,
+            }
+        )
+    )
+    ack = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+    if not ack.get("accepted", False):
+        raise spiritai_bridge.RobotServerProtocolError(f"Initial gripper reset rejected: {ack.get('error')}")
+    logging.info(
+        "Initial gripper reset accepted: chunk_id=%s actions=%s expected_finish_at=%s",
+        ack.get("chunk_id"),
+        reset_commands.shape,
+        ack.get("expected_finish_at"),
+    )
+
+
 def _infer_policy_actions(
     policy: _websocket_client_policy.WebsocketClientPolicy,
     obs: dict,
@@ -93,6 +169,10 @@ def main(args: Args) -> None:
         raise ValueError(f"prefetch_delay_fraction must be in [0, 1], got {args.prefetch_delay_fraction}")
     if args.execute_steps is not None and args.execute_steps <= 0:
         raise ValueError(f"execute_steps must be positive when set, got {args.execute_steps}")
+    if args.gripper_initial_tolerance < 0:
+        raise ValueError(f"gripper_initial_tolerance must be non-negative, got {args.gripper_initial_tolerance}")
+    if args.gripper_reset_steps <= 0:
+        raise ValueError(f"gripper_reset_steps must be positive, got {args.gripper_reset_steps}")
 
     policy = _websocket_client_policy.WebsocketClientPolicy(
         host=args.policy_host,
@@ -132,6 +212,10 @@ def main(args: Args) -> None:
             time.sleep(args.startup_delay_s)
 
         max_chunk = int(metadata.get("max_chunk", 60))
+        if args.gripper_reset_steps > max_chunk:
+            raise ValueError(
+                f"gripper_reset_steps must be <= robot_server max_chunk ({max_chunk}), got {args.gripper_reset_steps}"
+            )
         motion_limits = spiritai_bridge.JointMotionLimits(
             max_arm_velocity_rad_s=args.max_arm_velocity_rad_s,
             max_torso_velocity_rad_s=args.max_torso_velocity_rad_s,
@@ -148,6 +232,62 @@ def main(args: Args) -> None:
             max_base_speed=args.max_base_speed,
             max_cart_accel=args.max_cart_accel,
         )
+
+        _wait_until_robot_idle(robot_ws, args.busy_sleep_s)
+        initial_obs, _ = _get_robot_obs(robot_ws)
+        left_gripper, right_gripper = _get_gripper_state(initial_obs)
+        if _grippers_at_initial_state(
+            initial_obs,
+            initial_gripper_obs_state=args.initial_gripper_obs_state,
+            tolerance=args.gripper_initial_tolerance,
+        ):
+            logging.info(
+                "Initial gripper state OK: left=%.4f right=%.4f target=%.4f",
+                left_gripper,
+                right_gripper,
+                args.initial_gripper_obs_state,
+            )
+        else:
+            logging.warning(
+                "Initial gripper state is not reset: left=%.4f right=%.4f target=%.4f tolerance=%.4f; "
+                "resetting before inference with command=%.4f.",
+                left_gripper,
+                right_gripper,
+                args.initial_gripper_obs_state,
+                args.gripper_initial_tolerance,
+                args.gripper_reset_command_state,
+            )
+            _send_initial_gripper_reset(
+                robot_ws,
+                initial_obs,
+                policy_action_layout=args.policy_action_layout,
+                robot_command_kind=robot_command_kind,
+                command_dim=command_dim,
+                gripper_reset_command_state=args.gripper_reset_command_state,
+                gripper_reset_steps=args.gripper_reset_steps,
+                source_hz=args.source_hz,
+            )
+            _wait_until_robot_idle(robot_ws, args.busy_sleep_s)
+            verify_obs, _ = _get_robot_obs(robot_ws)
+            verify_left_gripper, verify_right_gripper = _get_gripper_state(verify_obs)
+            if not _grippers_at_initial_state(
+                verify_obs,
+                initial_gripper_obs_state=args.initial_gripper_obs_state,
+                tolerance=args.gripper_initial_tolerance,
+            ):
+                raise RuntimeError(
+                    "Initial gripper reset did not reach target: "
+                    f"left={verify_left_gripper:.4f} right={verify_right_gripper:.4f} "
+                    f"target={args.initial_gripper_obs_state:.4f} "
+                    f"tolerance={args.gripper_initial_tolerance:.4f}"
+                )
+            logging.info(
+                "Initial gripper reset verified: left=%.4f right=%.4f target=%.4f",
+                verify_left_gripper,
+                verify_right_gripper,
+                args.initial_gripper_obs_state,
+            )
+
         previous_state = None
         previous_commands = None
         prefetched_actions = None
