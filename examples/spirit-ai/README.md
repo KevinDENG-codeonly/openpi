@@ -50,21 +50,21 @@ Operational notes and tuning history live in separate files:
 
 | File | Purpose |
 |------|---------|
-| [`real_robot_notes.md`](real_robot_notes.md) | Current Thor deployment status, motion findings, and next engineering work |
-| [`motion_benchmark_plan.md`](motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
+| [`docs/real_robot_notes.md`](docs/real_robot_notes.md) | Current Thor deployment status, motion findings, and next engineering work |
+| [`docs/motion_benchmark_plan.md`](docs/motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
 
-## Step 1: Check & Fix Dataset Instructions
+## Step 1: Prepare Dataset Instructions
 
-Spirit AI datasets often use the folder name as the task text, which is not a useful language instruction for the model. Use the provided utility to check and fix this:
+Spirit AI datasets often use the folder name as the task text, which is not a useful language instruction for the model. Use `dataset_transform.py` to check and repair the dataset task text:
 
 ```bash
 # Dry-run: inspect the dataset
-uv run python examples/spirit-ai/check_instruction_manually.py \
-    --default_prompt "Your Prompt" \
-    --dataset_dir /path/to/your_dataset
+uv run python examples/spirit-ai/dataset_transform.py check \
+    --dataset_dir /path/to/your_dataset \
+    --default_prompt "Your Prompt"
 
 # Apply fix: write a repaired copy with a proper instruction
-uv run python examples/spirit-ai/check_instruction_manually.py \
+uv run python examples/spirit-ai/dataset_transform.py repair-instruction \
     --dataset_dir /path/to/your_dataset \
     --default_prompt "Fold the cardboard sheet along the creases to form a box" \
     --output_dir /path/to/your_dataset_repaired \
@@ -72,6 +72,45 @@ uv run python examples/spirit-ai/check_instruction_manually.py \
 ```
 
 Use the **repaired** dataset for all subsequent steps.
+
+The old `check_instruction_manually.py` script is kept as a compatibility wrapper, but new workflows should call `dataset_transform.py` directly.
+
+### 1a. Optional: Build a Multiscale Dataset
+
+For long-horizon tasks with subtask annotation metadata, you can build a mixed dataset containing both:
+
+- full global episodes with the overview instruction;
+- subtask-sliced episodes with prompts of the form `<overview>. Current step: <subtask>.`
+
+This keeps deployment aligned with a global prompt such as `fold the box`, while giving fine-tuning extra local supervision for each stage.
+
+By default, `build-multiscale` does **not** use subtask annotations. This is intentional because not every Spirit AI dataset has subtask metadata. Add `--slice-episodes` only when the source dataset has valid annotation segments in `meta/episodes.jsonl`.
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py build-multiscale \
+    --dataset_dir /home/deng/Documents/dataset/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice \
+    --output_dir /home/deng/Documents/dataset/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice_Multiscale \
+    --global_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
+    --slice-episodes \
+    --global_repeat 1 \
+    --subtask_repeat 1 \
+    --video_mode slice \
+    --video_workers 6 \
+    --overwrite
+```
+
+With `global_repeat=1` and `subtask_repeat=1`, the total full-episode frames and total subtask-sliced frames are approximately `1:1`. If you omit `--video_mode slice`, the CLI uses `link-full`: parquet episodes are sliced, but videos are hardlinked to the original full recording and source timestamps are preserved. With `--video_mode slice`, each subtask episode gets physically sliced videos; `--video_workers` controls how many camera videos are sliced in parallel.
+
+After building, validate the output:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py check \
+    --dataset_dir /home/deng/Documents/dataset/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice_Multiscale \
+    --default_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
+    --allow-derived-prompts
+```
+
+For detailed CLI options, see [`docs/dataset_transform_cli.md`](docs/dataset_transform_cli.md).
 
 ## Step 2: Create a Symlink for the Local Dataset
 
@@ -750,8 +789,8 @@ Keep the main README focused on the standard deployment path. Use these companio
 
 | File | Purpose |
 |------|---------|
-| [`real_robot_notes.md`](real_robot_notes.md) | Current Thor deployment status, motion findings, and recommended next engineering work |
-| [`motion_benchmark_plan.md`](motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
+| [`docs/real_robot_notes.md`](docs/real_robot_notes.md) | Current Thor deployment status, motion findings, and recommended next engineering work |
+| [`docs/motion_benchmark_plan.md`](docs/motion_benchmark_plan.md) | Parameter benchmark matrix for jitter, continuity, and task intent |
 
 Current short summary:
 
@@ -770,11 +809,12 @@ Current short summary:
 | [`src/openpi/policies/spiritai_policy.py`](../../src/openpi/policies/spiritai_policy.py) | Input/output transforms (`SpiritaiInputs`, `SpiritaiOutputs`) |
 | [`src/openpi/policies/spiritai_bridge.py`](../../src/openpi/policies/spiritai_bridge.py) | `robot_server` observation mapping, metadata handling, msgpack codec, 27D→joint conversion, and 25D→Cartesian conversion |
 | [`src/openpi/training/config.py`](../../src/openpi/training/config.py) | `LeRobotSpiritaiDataConfig` and `pi05_spiritai_lora` TrainConfig |
-| [`examples/spirit-ai/check_instruction_manually.py`](check_instruction_manually.py) | Dataset instruction validation & repair utility |
+| [`examples/spirit-ai/dataset_transform.py`](dataset_transform.py) | Dataset instruction validation, repair, and multiscale dataset builder |
+| [`examples/spirit-ai/docs/dataset_transform_cli.md`](docs/dataset_transform_cli.md) | Dataset transform CLI reference |
 | [`examples/spirit-ai/main.py`](main.py) | Default real robot bridge entry point for Precision policy server ↔ Thor `robot_server` |
 | [`examples/spirit-ai/env.py`](env.py) | Legacy direct MOZ1 SDK environment kept for reference |
-| [`examples/spirit-ai/real_robot_notes.md`](real_robot_notes.md) | Current deployment notes and motion-tuning interpretation |
-| [`examples/spirit-ai/motion_benchmark_plan.md`](motion_benchmark_plan.md) | Motion smoothness benchmark matrix |
+| [`examples/spirit-ai/docs/real_robot_notes.md`](docs/real_robot_notes.md) | Current deployment notes and motion-tuning interpretation |
+| [`examples/spirit-ai/docs/motion_benchmark_plan.md`](docs/motion_benchmark_plan.md) | Motion smoothness benchmark matrix |
 
 ### Data Flow
 
