@@ -235,9 +235,12 @@ def run_build_multiscale(args: argparse.Namespace) -> None:
         subtask_repeat=args.subtask_repeat,
         prefer_english=not args.prefer_chinese_subtasks,
         video_mode=args.video_mode,
+        video_slice_codec=args.video_slice_codec,
         min_slice_frames=args.min_slice_frames,
         progress=not args.quiet,
         video_workers=args.video_workers,
+        allow_missing_videos=args.allow_missing_videos,
+        strict_video_sync=not args.no_strict_video_sync,
     )
     print(f"Output dataset:    {summary.output_dir}")
     print(f"Total episodes:    {summary.total_episodes}")
@@ -247,6 +250,36 @@ def run_build_multiscale(args: argparse.Namespace) -> None:
     print(f"Total frames:      {summary.total_frames}")
     print(f"Total tasks:       {summary.total_tasks}")
     print("Done.")
+
+
+def run_verify_video_sync(args: argparse.Namespace) -> None:
+    from utils import video_sync
+
+    dataset_dir = Path(args.dataset_dir).resolve()
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+    episode_indices = set(args.episode_index) if args.episode_index else None
+    summary = video_sync.validate_dataset_video_sync(
+        dataset_dir,
+        strict_frame_count=args.strict_frame_count,
+        episode_indices=episode_indices,
+        progress=not args.quiet,
+        max_issues=args.max_issues,
+    )
+    print(f"Checked episodes: {summary.checked_episodes}")
+    print(f"Checked videos:   {summary.checked_videos}")
+    print(f"Issues:           {len(summary.issues)}")
+    for issue in summary.issues:
+        print(
+            (
+                f"  episode={issue.episode_index} key={issue.video_key}: {issue.message} "
+                f"parquet_rows={issue.parquet_rows} decoded_frames={issue.decoded_frames} "
+                f"parquet_ts={issue.parquet_timestamp} decoded_ts={issue.decoded_timestamp}"
+            )
+        )
+    if summary.issues:
+        raise SystemExit(1)
+    print("PASS - Video sync checks passed.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -275,9 +308,54 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--min-slice-frames", "--min_slice_frames", dest="min_slice_frames", type=int, default=2)
     build.add_argument("--prefer-chinese-subtasks", "--prefer_chinese_subtasks", action="store_true")
     build.add_argument("--video-mode", "--video_mode", choices=["link-full", "copy-full", "slice"], default="link-full")
+    build.add_argument(
+        "--video-slice-codec",
+        "--video_slice_codec",
+        dest="video_slice_codec",
+        choices=["reencode", "copy"],
+        default="reencode",
+        help="Codec strategy for --video_mode slice. reencode is safe; copy is fast but can produce bad tail frames.",
+    )
     build.add_argument("--video-workers", "--video_workers", dest="video_workers", type=int, default=1)
+    build.add_argument(
+        "--allow-missing-videos",
+        "--allow_missing_videos",
+        dest="allow_missing_videos",
+        action="store_true",
+        help="Allow missing source videos instead of failing the build.",
+    )
+    build.add_argument(
+        "--no-strict-video-sync",
+        "--no_strict_video_sync",
+        dest="no_strict_video_sync",
+        action="store_true",
+        help="Disable per-sliced-episode ffprobe/torchcodec validation after video generation.",
+    )
     build.add_argument("--quiet", action="store_true", help="Disable build progress messages.")
     build.add_argument("--overwrite", action="store_true")
+
+    verify_video = subparsers.add_parser(
+        "verify-video-sync",
+        help="Verify that parquet timestamps can be decoded from dataset videos.",
+    )
+    verify_video.add_argument("--dataset-dir", "--dataset_dir", dest="dataset_dir", required=True)
+    verify_video.add_argument(
+        "--strict-frame-count",
+        "--strict_frame_count",
+        dest="strict_frame_count",
+        action="store_true",
+        help="Require each video's real decoded frame count to equal the episode parquet row count.",
+    )
+    verify_video.add_argument(
+        "--episode-index",
+        "--episode_index",
+        dest="episode_index",
+        type=int,
+        action="append",
+        help="Only check a specific episode. Can be repeated.",
+    )
+    verify_video.add_argument("--max-issues", "--max_issues", dest="max_issues", type=int, default=None)
+    verify_video.add_argument("--quiet", action="store_true", help="Disable progress messages.")
 
     return parser
 
@@ -297,6 +375,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "build-multiscale":
         run_build_multiscale(args)
+    elif args.command == "verify-video-sync":
+        run_verify_video_sync(args)
     else:
         parser.error(f"Unknown command: {args.command}")
 

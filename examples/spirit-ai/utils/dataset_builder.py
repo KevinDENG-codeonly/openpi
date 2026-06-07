@@ -5,6 +5,7 @@ import dataclasses
 import copy
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -15,9 +16,11 @@ import pyarrow.parquet as pq
 from utils import annotations
 from utils import instructions
 from utils import lerobot_io
+from utils import video_sync
 
 
 VideoMode = Literal["link-full", "copy-full", "slice"]
+VideoSliceCodec = Literal["reencode", "copy"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,6 +46,67 @@ class _BuildState:
     skipped_subtasks: int = 0
 
 
+@dataclasses.dataclass
+class _VideoProgress:
+    total_jobs: int
+    enabled: bool
+    completed_jobs: int = 0
+    failed_jobs: int = 0
+    started_at: float = dataclasses.field(default_factory=time.monotonic)
+    last_report_at: float = dataclasses.field(default_factory=time.monotonic)
+
+    def start(self, *, video_mode: VideoMode, video_slice_codec: VideoSliceCodec, video_workers: int) -> None:
+        if not self.enabled or self.total_jobs == 0:
+            return
+        print(
+            (
+                f"Video slicing plan: jobs={self.total_jobs}, "
+                f"video_mode={video_mode}, codec={video_slice_codec}, workers={video_workers}"
+            ),
+            flush=True,
+        )
+
+    def mark_done(self, *, failed: bool = False, force: bool = False) -> None:
+        self.completed_jobs += 1
+        if failed:
+            self.failed_jobs += 1
+        if not self.enabled or self.total_jobs == 0:
+            return
+
+        now = time.monotonic()
+        should_report = (
+            force
+            or self.completed_jobs == 1
+            or self.completed_jobs == self.total_jobs
+            or self.completed_jobs % 25 == 0
+            or now - self.last_report_at >= 5.0
+        )
+        if not should_report:
+            return
+        self.last_report_at = now
+        percent = (self.completed_jobs / self.total_jobs) * 100
+        print(
+            (
+                f"Slicing videos: {percent:5.1f}% "
+                f"({self.completed_jobs}/{self.total_jobs}), failed={self.failed_jobs}, "
+                f"elapsed={now - self.started_at:.1f}s"
+            ),
+            flush=True,
+        )
+
+    def finish(self) -> None:
+        if not self.enabled or self.total_jobs == 0:
+            return
+        elapsed = time.monotonic() - self.started_at
+        print(
+            (
+                f"Video slicing complete: {self.completed_jobs}/{self.total_jobs} jobs, "
+                f"failed={self.failed_jobs}, elapsed={elapsed:.1f}s"
+            ),
+            flush=True,
+        )
+
+
 def _progress(message: str, *, enabled: bool) -> None:
     if enabled:
         print(message, flush=True)
@@ -59,25 +123,40 @@ def build_multiscale_dataset(
     subtask_repeat: int = 1,
     prefer_english: bool = True,
     video_mode: VideoMode = "link-full",
+    video_slice_codec: VideoSliceCodec = "reencode",
     min_slice_frames: int = 2,
     progress: bool = True,
     video_workers: int = 1,
+    allow_missing_videos: bool = False,
+    strict_video_sync: bool = True,
 ) -> BuildSummary:
     if global_repeat < 0 or subtask_repeat < 0:
         raise ValueError("global_repeat and subtask_repeat must be >= 0")
     if video_mode not in {"link-full", "copy-full", "slice"}:
         raise ValueError(f"Unsupported video_mode: {video_mode}")
+    if video_slice_codec not in {"reencode", "copy"}:
+        raise ValueError(f"Unsupported video_slice_codec: {video_slice_codec}")
     if video_workers < 1:
         raise ValueError("video_workers must be >= 1")
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
     if slice_episodes and video_mode == "slice" and shutil.which("ffmpeg") is None:
         raise RuntimeError("--video-mode slice requires ffmpeg to be available on PATH")
+    if slice_episodes and video_mode == "slice" and strict_video_sync and shutil.which("ffprobe") is None:
+        raise RuntimeError("--video-mode slice with strict validation requires ffprobe to be available on PATH")
 
     meta_dir = dataset_dir / "meta"
     info = lerobot_io.read_json(meta_dir / "info.json")
     episodes = lerobot_io.read_jsonl(meta_dir / "episodes.jsonl")
     source_dataset_json = lerobot_io.read_json(dataset_dir / "dataset.json")
+    video_sync.validate_source_dataset_structure(
+        dataset_dir,
+        info,
+        episodes,
+        allow_missing_videos=allow_missing_videos,
+        check_video_tail=True,
+        progress=progress,
+    )
     total_global = len(episodes) * global_repeat
     total_subtasks = 0
     if slice_episodes:
@@ -89,7 +168,7 @@ def build_multiscale_dataset(
         (
             f"Building multiscale dataset: {len(episodes)} source episodes, "
             f"{total_global} global outputs, {total_subtasks} subtask outputs, "
-            f"video_mode={video_mode}, video_workers={video_workers}"
+            f"video_mode={video_mode}, video_slice_codec={video_slice_codec}, video_workers={video_workers}"
         ),
         enabled=progress,
     )
@@ -109,6 +188,11 @@ def build_multiscale_dataset(
                     tasks.append({"task_index": task_to_index[prompt], "task": prompt})
 
     state = _BuildState()
+    video_progress = _VideoProgress(
+        total_jobs=total_subtasks * len(lerobot_io.video_keys(info)) if slice_episodes and video_mode == "slice" else 0,
+        enabled=progress,
+    )
+    video_progress.start(video_mode=video_mode, video_slice_codec=video_slice_codec, video_workers=video_workers)
 
     global_counter = 0
     for repeat_index in range(global_repeat):
@@ -134,6 +218,7 @@ def build_multiscale_dataset(
                 video_mode="copy-full" if video_mode == "copy-full" else "link-full",
                 progress=progress,
                 video_workers=video_workers,
+                allow_missing_videos=allow_missing_videos,
             )
 
     if slice_episodes:
@@ -170,7 +255,14 @@ def build_multiscale_dataset(
                         min_slice_frames=min_slice_frames,
                         progress=progress,
                         video_workers=video_workers,
+                        video_slice_codec=video_slice_codec,
+                        video_progress=video_progress,
+                        allow_missing_videos=allow_missing_videos,
+                        strict_video_sync=strict_video_sync,
+                        source_subtask_index=segment_index - 1,
                     )
+
+    video_progress.finish()
 
     _write_metadata(
         output_dir=output_dir,
@@ -202,6 +294,7 @@ def _append_full_episode(
     video_mode: VideoMode,
     progress: bool,
     video_workers: int,
+    allow_missing_videos: bool,
 ) -> None:
     source_episode_index = int(source_episode["episode_index"])
     source_table = _read_source_table(dataset_dir, info, source_episode_index)
@@ -225,6 +318,9 @@ def _append_full_episode(
         end_time=None,
         progress=progress,
         video_workers=video_workers,
+        video_slice_codec="copy",
+        video_progress=None,
+        allow_missing_videos=allow_missing_videos,
     )
     _record_episode(
         source_episode=source_episode,
@@ -253,27 +349,31 @@ def _append_sliced_episode(
     min_slice_frames: int,
     progress: bool,
     video_workers: int,
+    video_slice_codec: VideoSliceCodec,
+    video_progress: _VideoProgress,
+    allow_missing_videos: bool,
+    strict_video_sync: bool,
+    source_subtask_index: int,
 ) -> None:
     timestamp = source_table["timestamp"]
     mask = pc.and_(
         pc.greater_equal(timestamp, pa.scalar(segment["start_time"], type=timestamp.type)),
         pc.less(timestamp, pa.scalar(segment["end_time"], type=timestamp.type)),
     )
-    table = source_table.filter(mask)
-    if table.num_rows < min_slice_frames:
+    selected_table = source_table.filter(mask)
+    if selected_table.num_rows < min_slice_frames:
         state.skipped_subtasks += 1
         return
 
     new_episode_index = state.next_episode_index
     reset_timestamp = video_mode == "slice"
     table = _rewrite_episode_columns(
-        table,
+        selected_table,
         episode_index=new_episode_index,
         task_index=task_index,
         global_frame_start=state.next_global_frame_index,
         reset_timestamp=reset_timestamp,
     )
-    _write_episode_table(output_dir, info, new_episode_index, table)
     _copy_or_slice_videos(
         dataset_dir=dataset_dir,
         output_dir=output_dir,
@@ -281,11 +381,30 @@ def _append_sliced_episode(
         source_episode_index=int(source_episode["episode_index"]),
         new_episode_index=new_episode_index,
         video_mode=video_mode,
+        video_slice_codec=video_slice_codec,
         start_time=segment["start_time"],
         end_time=segment["end_time"],
+        start_frame=_first_int(selected_table, "frame_index"),
+        end_frame=_last_int(selected_table, "frame_index"),
+        expected_frame_count=table.num_rows,
         progress=progress,
         video_workers=video_workers,
+        video_progress=video_progress,
+        allow_missing_videos=allow_missing_videos,
     )
+    if video_mode == "slice" and strict_video_sync:
+        issues = video_sync.validate_episode_videos(
+            dataset_dir=output_dir,
+            info=info,
+            episode_index=new_episode_index,
+            timestamps=[float(value.as_py()) for value in table["timestamp"]],
+            strict_frame_count=True,
+            expected_frame_count=table.num_rows,
+        )
+        if issues:
+            details = "\n".join(f"  - {issue.video_key}: {issue.message}" for issue in issues[:12])
+            raise RuntimeError(f"Video sync validation failed for generated episode={new_episode_index}:\n{details}")
+    _write_episode_table(output_dir, info, new_episode_index, table)
     _record_episode(
         source_episode=source_episode,
         state=state,
@@ -295,8 +414,17 @@ def _append_sliced_episode(
         task_text=task_text,
         kind="subtask",
         segment=segment,
+        source_subtask_index=source_subtask_index,
     )
     state.subtask_episodes += 1
+
+
+def _first_int(table: pa.Table, column_name: str) -> int:
+    return int(table[column_name][0].as_py())
+
+
+def _last_int(table: pa.Table, column_name: str) -> int:
+    return int(table[column_name][table.num_rows - 1].as_py())
 
 
 def _read_source_table(dataset_dir: Path, info: dict, episode_index: int) -> pa.Table:
@@ -356,33 +484,37 @@ def _copy_or_slice_videos(
     source_episode_index: int,
     new_episode_index: int,
     video_mode: VideoMode,
+    video_slice_codec: VideoSliceCodec,
     start_time: float | None,
     end_time: float | None,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+    expected_frame_count: int | None = None,
     progress: bool,
     video_workers: int,
+    video_progress: _VideoProgress | None,
+    allow_missing_videos: bool,
 ) -> None:
     keys = lerobot_io.video_keys(info)
     slice_jobs = []
     for video_number, video_key in enumerate(keys, start=1):
         source = dataset_dir / lerobot_io.format_video_path(info, video_key, source_episode_index)
         if not source.exists():
-            continue
+            if allow_missing_videos:
+                continue
+            raise FileNotFoundError(f"Missing source video: episode={source_episode_index} key={video_key} path={source}")
         target = output_dir / lerobot_io.format_video_path(info, video_key, new_episode_index)
         if video_mode == "slice" and start_time is not None and end_time is not None:
-            _progress(
-                (
-                    f"  slicing video {video_number}/{len(keys)} key={video_key} "
-                    f"source_episode={source_episode_index} -> episode={new_episode_index} "
-                    f"time={start_time:.3f}-{end_time:.3f}"
-                ),
-                enabled=progress,
-            )
             slice_jobs.append(
                 {
                     "source": source,
                     "target": target,
                     "start_time": start_time,
                     "end_time": end_time,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "expected_frame_count": expected_frame_count,
+                    "video_slice_codec": video_slice_codec,
                     "video_key": video_key,
                     "source_episode_index": source_episode_index,
                     "new_episode_index": new_episode_index,
@@ -393,20 +525,34 @@ def _copy_or_slice_videos(
             lerobot_io.link_or_copy_file(source, target, mode=mode)
 
     if slice_jobs:
-        _run_slice_jobs(slice_jobs, video_workers=video_workers)
+        _run_slice_jobs(slice_jobs, video_workers=video_workers, video_progress=video_progress)
 
 
-def _run_slice_jobs(slice_jobs: list[dict], *, video_workers: int) -> None:
+def _run_slice_jobs(slice_jobs: list[dict], *, video_workers: int, video_progress: _VideoProgress | None) -> None:
     if video_workers == 1 or len(slice_jobs) == 1:
         for job in slice_jobs:
-            _slice_video(**job)
+            try:
+                _slice_video(**job)
+            except Exception:
+                if video_progress is not None:
+                    video_progress.mark_done(failed=True, force=True)
+                raise
+            if video_progress is not None:
+                video_progress.mark_done()
         return
 
     max_workers = min(video_workers, len(slice_jobs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_slice_video, **job) for job in slice_jobs]
         for future in concurrent.futures.as_completed(futures):
-            future.result()
+            try:
+                future.result()
+            except Exception:
+                if video_progress is not None:
+                    video_progress.mark_done(failed=True, force=True)
+                raise
+            if video_progress is not None:
+                video_progress.mark_done()
 
 
 def _slice_video(
@@ -415,27 +561,61 @@ def _slice_video(
     *,
     start_time: float,
     end_time: float,
+    start_frame: int | None,
+    end_frame: int | None,
+    expected_frame_count: int | None,
+    video_slice_codec: VideoSliceCodec,
     video_key: str,
     source_episode_index: int,
     new_episode_index: int,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-ss",
-        f"{start_time:.6f}",
-        "-to",
-        f"{end_time:.6f}",
-        "-i",
-        str(source),
-        "-c",
-        "copy",
-        str(target),
-    ]
+    if video_slice_codec == "copy":
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start_time:.6f}",
+            "-to",
+            f"{end_time:.6f}",
+            "-i",
+            str(source),
+            "-c",
+            "copy",
+            str(target),
+        ]
+    else:
+        if start_frame is None or end_frame is None or expected_frame_count is None:
+            raise ValueError("reencode video slicing requires start_frame, end_frame, and expected_frame_count")
+        select_expr = f"select=between(n\\,{start_frame}\\,{end_frame}),setpts=N/(30*TB)"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            select_expr,
+            "-vsync",
+            "0",
+            "-frames:v",
+            str(expected_frame_count),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            str(target),
+        ]
     try:
         subprocess.run(command, check=True)
     except subprocess.CalledProcessError as exc:
@@ -456,6 +636,7 @@ def _record_episode(
     task_text: str,
     kind: str,
     segment: dict | None = None,
+    source_subtask_index: int | None = None,
 ) -> None:
     episode = copy.deepcopy(source_episode)
     episode["episode_index"] = new_episode_index
@@ -466,6 +647,7 @@ def _record_episode(
     episode["transform_kind"] = kind
     if segment is not None:
         episode["subtask"] = {
+            "source_subtask_index": source_subtask_index,
             "start_time": segment["start_time"],
             "end_time": segment["end_time"],
             "action": segment.get("action"),

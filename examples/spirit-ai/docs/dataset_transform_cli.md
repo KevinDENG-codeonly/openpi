@@ -83,7 +83,11 @@ slice       Use ffmpeg to write true sliced videos and reset timestamps.
 
 Use `--video_mode slice` only when `ffmpeg` is available and you need each generated episode video to be physically trimmed.
 
-When `--video_mode slice` is used, the CLI prints progress for source episodes, subtask segments, and each camera video being sliced. Use `--quiet` to suppress these progress messages.
+When `--video_mode slice` is used, the default `--video_slice_codec reencode` path re-encodes each clip at 30 fps and then verifies that each camera video has the same real decodable frame count as the generated parquet episode. This is slower than stream copy, but it avoids tail-frame decode failures during training.
+
+`--video_slice_codec copy` keeps the old fast `ffmpeg -c copy` behavior. It is not recommended for training datasets because stream-copy trimming can leave MP4 header metadata inconsistent with the real decodable frame sequence.
+
+The CLI prints the planned video operation, periodic percentage progress, and a final completion summary. It no longer prints one line per camera video. Use `--quiet` to suppress these progress messages.
 
 Video slicing is serial by default. Use `--video_workers` to run multiple camera video slice jobs in parallel for each generated subtask episode:
 
@@ -94,10 +98,39 @@ uv run python examples/spirit-ai/dataset_transform.py build-multiscale \
     --global_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
     --slice-episodes \
     --video_mode slice \
+    --video_slice_codec reencode \
     --video_workers 6
 ```
 
 The dataset metadata and parquet files are still generated sequentially; only the per-camera `ffmpeg` slice jobs are parallelized.
+
+Missing source videos fail the build by default. Use `--allow_missing_videos` only for intentionally partial datasets.
+
+## Verify Video Sync
+
+Before training on a generated dataset, verify that parquet timestamps can be decoded from the videos:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
+    --dataset_dir /path/to/output_dataset
+```
+
+For physically sliced datasets, also require the real decoded frame count to equal the episode parquet row count:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
+    --dataset_dir /path/to/output_dataset \
+    --strict_frame_count
+```
+
+To inspect one episode:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
+    --dataset_dir /path/to/output_dataset \
+    --episode_index 1519 \
+    --strict_frame_count
+```
 
 ## After Building
 
@@ -110,6 +143,7 @@ uv run python examples/spirit-ai/dataset_transform.py check \
     --allow-derived-prompts
 ```
 
-2. Create or update the LeRobot cache symlink for the new dataset.
-3. Recompute normalization stats for the training config.
-4. Train with `DataConfig(prompt_from_task=True)` so openpi reads the generated task prompts from `task_index`.
+2. Run `verify-video-sync` on the output dataset. Add `--strict_frame_count` when `--video_mode slice` was used.
+3. Create or update the LeRobot cache symlink for the new dataset.
+4. Recompute normalization stats for the training config.
+5. Train with `DataConfig(prompt_from_task=True)` so openpi reads the generated task prompts from `task_index`.

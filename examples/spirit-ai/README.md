@@ -95,11 +95,14 @@ uv run python examples/spirit-ai/dataset_transform.py build-multiscale \
     --global_repeat 1 \
     --subtask_repeat 1 \
     --video_mode slice \
+    --video_slice_codec reencode \
     --video_workers 6 \
     --overwrite
 ```
 
-With `global_repeat=1` and `subtask_repeat=1`, the total full-episode frames and total subtask-sliced frames are approximately `1:1`. If you omit `--video_mode slice`, the CLI uses `link-full`: parquet episodes are sliced, but videos are hardlinked to the original full recording and source timestamps are preserved. With `--video_mode slice`, each subtask episode gets physically sliced videos; `--video_workers` controls how many camera videos are sliced in parallel.
+With `global_repeat=1` and `subtask_repeat=1`, the total full-episode frames and total subtask-sliced frames are approximately `1:1`. If you omit `--video_mode slice`, the CLI uses `link-full`: parquet episodes are sliced, but videos are hardlinked to the original full recording and source timestamps are preserved.
+
+With `--video_mode slice`, each subtask episode gets physically sliced videos. The recommended training path is `--video_slice_codec reencode`, which re-encodes fixed-rate clips and validates that each camera video has the same real decodable frame count as the parquet episode. The older `--video_slice_codec copy` path is faster but can produce MP4 tail-frame metadata mismatches, so avoid it for training datasets. `--video_workers` controls how many camera videos are sliced in parallel.
 
 After building, validate the output:
 
@@ -108,6 +111,14 @@ uv run python examples/spirit-ai/dataset_transform.py check \
     --dataset_dir /home/deng/Documents/dataset/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice_Multiscale \
     --default_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
     --allow-derived-prompts
+```
+
+For physically sliced datasets, also verify video synchronization before computing norm stats or training:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
+    --dataset_dir /home/deng/Documents/dataset/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice_Multiscale \
+    --strict_frame_count
 ```
 
 For detailed CLI options, see [`docs/dataset_transform_cli.md`](docs/dataset_transform_cli.md).
