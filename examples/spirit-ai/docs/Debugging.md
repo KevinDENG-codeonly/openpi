@@ -1,18 +1,18 @@
 # Debugging Notes
 
-## multiscale 训练中 torchcodec 读视频尾帧失败
+## TorchCodec Fails on the Last Video Frame in Multiscale Training
 
-**问题**：pi0.5 微调跑到中途后 DataLoader worker 报错：
+**Symptom:** pi0.5 fine-tuning fails in a DataLoader worker with:
 
 ```text
 RuntimeError: Requested next frame while there are no more frames left to decode.
 ```
 
-一次复现中，最后正常日志在 `Step 17200` 附近，实际坏样本是 multiscale dataset 的 `episode=1519`、`global_idx=694552`、`timestamp=6.833333333333333`。6 路 camera 都无法用 torchcodec 解码这个最后 timestamp。
+One reproduced case failed after the last healthy log near `Step 17200`. The bad sample was in the multiscale dataset at `episode=1519`, `global_idx=694552`, `timestamp=6.833333333333333`. All 6 camera videos failed to decode that final timestamp with TorchCodec.
 
-**原因**：旧的 `build-multiscale --video_mode slice` 使用 `ffmpeg -c copy` 进行 stream-copy 切片。这个方式很快，但不是 frame-exact。它可能生成 header 显示 `nb_frames=206`、duration 看起来足够，但真实可解码帧只有 205 帧，最后一帧 timestamp 是 `6.800000`。parquet 仍保留 `6.833333` 这一行，训练时 LeRobot/torchcodec 按 timestamp 读取尾帧就会越界。
+**Cause:** the old `build-multiscale --video_mode slice` path used `ffmpeg -c copy` stream-copy slicing. This is fast but not frame-exact. It can produce an MP4 whose header reports enough frames, for example `nb_frames=206`, while the real decodable video has only 205 frames and ends at timestamp `6.800000`. The parquet episode still contains the final `6.833333` timestamp, so LeRobot/TorchCodec fails when it tries to read that tail frame.
 
-**排查**：
+**Diagnose:**
 
 ```bash
 uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
@@ -21,9 +21,9 @@ uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
     --strict_frame_count
 ```
 
-如果是同类问题，会看到 decoded frame count 小于 parquet rows，或者 `torchcodec cannot decode last parquet timestamp`。
+For the same issue, the decoded video frame count is smaller than the parquet row count, or the verifier reports that TorchCodec cannot decode the last parquet timestamp.
 
-**解决**：重新 build 新 dataset，不要修补当前坏 dataset。推荐使用 reencode 切片并开启 strict sync：
+**Fix:** rebuild the dataset from the source dataset instead of patching the broken derived dataset. Use re-encoded slicing and strict sync validation:
 
 ```bash
 uv run python examples/spirit-ai/dataset_transform.py build-multiscale \
@@ -39,7 +39,7 @@ uv run python examples/spirit-ai/dataset_transform.py build-multiscale \
     --overwrite
 ```
 
-build 完后再跑完整检查：
+Then validate the rebuilt dataset:
 
 ```bash
 uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
@@ -47,135 +47,181 @@ uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
     --strict_frame_count
 ```
 
-`--video_slice_codec copy` 只建议用于快速实验，不建议用于训练数据。
+Use `--video_slice_codec copy` only for quick experiments, not for training datasets.
 
-## checkpoint 写入时 tmux/session 被 systemd-oomd 杀掉
+## Checkpoint Does Not Finalize: systemd-oomd, Root Swapfile, and Async Save
 
-**问题**：训练能正常跑到 `Step 5000`，但第一次保存 checkpoint 时任务突然退出，tmux session 也消失。wandb `output.log` 没有 Python traceback，只停在 Orbax checkpoint 写入附近：
+**Symptom:** training reaches a save step, but no final checkpoint directory appears. The task, terminal, or tmux scope may disappear. wandb `output.log` has no Python traceback and usually stops near Orbax checkpoint save/finalize logs:
 
 ```text
-Saving checkpoint at step 5000
+Saving checkpoint at step 1000
 Started async saving checkpoint ...
 Transferring arrays to host memory ...
-Wrote 71 array_metadata.ArrayMetadata ...
+Finished blocking save ... Continuing to save asynchronously ...
+Starting CheckpointManager Save Finalize thread=save_finalize
 ```
 
-对应时间点的 user journal 出现：
+The progress bar may continue to `1001/5100` or `1002/5100`, but that does not mean the checkpoint was saved. Orbax saves asynchronously: the main training loop can continue while the background save thread is still finalizing. A checkpoint is usable only after both lines appear:
 
 ```text
-systemd-oomd killed 468 process(es) in this unit.
+Finished asynchronous save
+CheckpointManager Save Finalize is done on all hosts
 ```
 
-另一次失败同样发生在 step 5000 checkpoint 写入阶段，并有：
+Failed saves leave only a temporary directory:
 
 ```text
-systemd-oomd killed 436 process(es) in this unit.
+checkpoints/<config>/<exp>/1000.orbax-checkpoint-tmp-0
 ```
 
-**原因**：这不是 dataset/video 读取问题，也不是磁盘空间不足。Orbax 保存 checkpoint 时会把 JAX 参数和 train state 搬到 host memory 并写盘，造成系统内存瞬时峰值。训练常驻内存、dataloader workers、视频解码预取、JAX/XLA buffers、wandb、桌面/terminal 进程和 checkpoint host-copy buffer 叠加后，触发了 `systemd-oomd`。如果训练是在 GUI terminal/VTE scope 里启动，`systemd-oomd` 会杀掉整个 `vte-spawn-...scope`，里面的 tmux server 也会一起死。
+The matching system journal may show:
 
-一次成功 checkpoint 的日志显示写入量大约是：
+```text
+systemd-oomd killed ... process(es) in this unit.
+Killed ... due to memory pressure ... > 50.00% for > 20s with reclaim activity
+```
+
+**Cause:** this is not a dataset/video read error, and it is not "no memory in the checkpoint tmp directory." Orbax copies JAX params and train state to host memory and then writes them through page cache/writeback. A pi0.5 LoRA checkpoint has logged write volume around:
 
 ```text
 params: 7.2 GiB
 train_state: 3.5 GiB
 ```
 
-实际保存过程的 RAM 峰值会高于写盘体积。没有 swap 时风险更高。
+The real host RAM, page cache, and writeback peak can be higher than the final checkpoint size. Persistent training memory, DataLoader workers, video decoding, JAX/XLA buffers, wandb, GUI terminal processes, and checkpoint host-copy buffers can combine into high memory pressure. If training was launched from a GUI terminal/VTE/Chromium scope, `systemd-oomd` can kill that whole scope, including the tmux server inside it.
 
-**排查**：
+In one reproduced case, `/swapfile` lived on the root filesystem and consumed 64GB, leaving only about 8GB free on `/` and `/tmp`. Checkpoints were written to `/home`, but root and `/tmp` pressure still worsened reclaim/writeback behavior. Moving swap to `/home/swapfile` freed `/` and `/tmp` from about 92% used to about 23% used; after that, the same `5100 steps / save_interval 1000` diagnostic run finalized the step 1000 checkpoint successfully.
+
+**Diagnose:**
 
 ```bash
 free -h
-journalctl --user --since '2026-06-08 01:15:00' --until '2026-06-08 01:30:00' --no-pager | rg 'systemd-oomd|vte-spawn'
+swapon --show
+df -h / /tmp /home
+journalctl --since 'YYYY-MM-DD HH:MM:SS' --until 'YYYY-MM-DD HH:MM:SS' --no-pager | rg 'systemd-oomd|oomd killed|memory pressure'
 ls -lah checkpoints/<config_name>/<exp_name>/
 find checkpoints/<config_name>/<exp_name> -maxdepth 2 -type d -name '*orbax-checkpoint-tmp*'
 ```
 
-如果 checkpoint 目录只留下 `5000.orbax-checkpoint-tmp-*`，没有最终 `5000/`，说明保存还没 finalize 就被杀了。
-
-**解决**：
-
-1. 添加 swap。64GB 是最低建议，磁盘空间充足时可以用 128GB：
+Watch PSI memory pressure around save steps:
 
 ```bash
-sudo fallocate -l 64G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-free -h
+watch -n 1 'date; free -h; cat /proc/pressure/memory; cat /sys/fs/cgroup/user.slice/user-1000.slice/memory.pressure'
 ```
 
-需要重启后保留 swap 时写入 `/etc/fstab`：
+If the checkpoint directory contains only `1000.orbax-checkpoint-tmp-*` or `5000.orbax-checkpoint-tmp-*`, and no final `1000/` or `5000/`, the save was interrupted before finalize.
+
+**Fix:**
+
+1. Keep `/`, `/tmp`, and `/home` healthy. Before long runs, leave at least tens of GB free on `/` and `/tmp`; `>50G` is preferable for large pi0.5 jobs.
+
+2. If a large swapfile is on `/`, move it to `/home` while no training job is running:
 
 ```bash
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+sudo fallocate -l 64G /home/swapfile
+sudo chmod 600 /home/swapfile
+sudo mkswap /home/swapfile
+sudo swapon /home/swapfile
+
+sudo swapoff /swapfile
+sudo cp /etc/fstab /etc/fstab.bak.$(date +%Y%m%d_%H%M%S)
+sudo sed -i '/\/swapfile[[:space:]]/d;/\/home\/swapfile[[:space:]]/d' /etc/fstab
+echo '/home/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+sudo rm /swapfile
+
+swapon --show
+df -h / /tmp /home
 ```
 
-2. 降低 dataloader workers。默认是 `6`，建议先用 `2`，折中可用 `4`：
+3. Remove failed Orbax temporary directories, and do not resume from them:
+
+```bash
+find checkpoints -type d -name "*.orbax-checkpoint-tmp-*" -print
+find checkpoints -type d -name "*.orbax-checkpoint-tmp-*" -prune -exec rm -rf {} +
+```
+
+4. Reduce DataLoader workers. The default is `6`; use `2` for stability-first runs or `4` as a compromise:
 
 ```bash
 --num-workers 2
 ```
 
-3. 重新训练时使用 `--overwrite`，不要从未完成的 `.orbax-checkpoint-tmp-*` 目录恢复。
-
-4. 启动前确认 GPU driver 正常：
+5. Run a short checkpoint stress test before the long run:
 
 ```bash
-nvidia-smi
+uv run python scripts/train.py <config_name> \
+    --exp-name <exp_name> \
+    --overwrite \
+    --num-train-steps 1100 \
+    --batch-size <batch_size> \
+    --num-workers <workers> \
+    --save-interval 1000 \
+    --keep-period 1000 \
+    --log-interval 100 \
+    --wandb-enabled \
+    --ema-decay None
 ```
 
-5. 如果加 swap 和降低 workers 后仍在 checkpoint 阶段 OOM，下一步应改 checkpoint 策略，只保存 LoRA/trainable params，而不是完整 base model params/train state。
+6. If `systemd-oomd` still kills the job during checkpoint finalize, run training outside GUI-integrated terminal scopes, or temporarily disable `systemd-oomd` for one diagnostic run.
 
-## wandb login 失败：API key must be 40 characters long
+7. If the issue persists after the system-side fixes, consider changing the checkpoint strategy to save only LoRA/trainable params instead of full base-model params and train state.
 
-**问题**：`wandb login` 粘贴 API key 后报错 `ValueError: API key must be 40 characters long, yours was 86`。
+## wandb Login Fails: API Key Must Be 40 Characters Long
 
-**原因**：wandb CLI 交互式写入 key 时校验逻辑与新版 API key 格式不兼容。
+**Symptom:** `wandb login` fails after pasting an API key:
 
-**解决**：绕过交互式 CLI，手动写入 `~/.netrc`：
+```text
+ValueError: API key must be 40 characters long, yours was 86
+```
+
+**Cause:** the interactive wandb CLI key validation is incompatible with the newer API key format in this environment.
+
+**Fix:** bypass the interactive CLI and write `~/.netrc` manually:
 
 ```bash
 cat >> ~/.netrc << 'EOF'
 machine api.wandb.ai
   login user
-  password <你的API_KEY>
+  password <YOUR_API_KEY>
 EOF
 ```
 
-**验证**：
+**Verify:**
 
 ```bash
 python -c "import wandb; print('logged_in' if wandb.api.api_key else 'not logged in')"
 ```
 
-或者跑一个测试 run：
+Or start a small online run:
 
 ```bash
 python -c "import wandb; wandb.init(project='test', mode='online').finish(); print('OK')"
 ```
 
-## 训练时 terminal 崩溃导致 checkpoint 无法保存
+## Terminal Crash Interrupts Checkpoint Save
 
-**问题**：训练过程中 checkpoint 写入时间较长，terminal 断连或崩溃后训练进程被杀掉，可能导致权重文件没有写入完成或保存失败。
+**Symptom:** checkpoint writes take a long time, and if the terminal disconnects or crashes during the write, training is killed and the checkpoint is incomplete.
 
-**原因**：训练进程直接挂在交互式 terminal 下，terminal 会话异常退出时会连带终止训练进程；如果刚好发生在 checkpoint 写盘阶段，就可能留下不完整的 checkpoint。
+**Cause:** the training process is attached directly to an interactive terminal. If that terminal exits during checkpoint write/finalize, the process can be terminated before Orbax finalizes the checkpoint.
 
-**解决**：用 `tmux` 启动训练任务，让训练进程脱离当前 terminal 会话：
+**Fix:** start long training jobs from `tmux`:
 
 ```bash
 tmux new -s spiritai_train
 
 uv run python scripts/train.py pi05_spiritai_lora \
-    --exp_name my_experiment \
+    --exp-name my_experiment \
     --overwrite
 ```
 
-启动后可按 `Ctrl-b` 再按 `d` 退出 tmux 会话，训练会继续在后台运行。需要查看进度时重新进入：
+Detach with `Ctrl-b`, then `d`. Reattach with:
 
 ```bash
 tmux attach -t spiritai_train
 ```
 
-**验证**：确认训练日志正常继续输出，并在 `checkpoints/pi05_spiritai_lora/<exp_name>/` 下看到完整的 checkpoint 目录。
+**Verify:** logs should continue after detaching, and finalized checkpoint directories should appear under:
+
+```text
+checkpoints/<config_name>/<exp_name>/<step>/
+```
