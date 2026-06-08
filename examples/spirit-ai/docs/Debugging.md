@@ -49,6 +49,85 @@ uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
 
 `--video_slice_codec copy` 只建议用于快速实验，不建议用于训练数据。
 
+## checkpoint 写入时 tmux/session 被 systemd-oomd 杀掉
+
+**问题**：训练能正常跑到 `Step 5000`，但第一次保存 checkpoint 时任务突然退出，tmux session 也消失。wandb `output.log` 没有 Python traceback，只停在 Orbax checkpoint 写入附近：
+
+```text
+Saving checkpoint at step 5000
+Started async saving checkpoint ...
+Transferring arrays to host memory ...
+Wrote 71 array_metadata.ArrayMetadata ...
+```
+
+对应时间点的 user journal 出现：
+
+```text
+systemd-oomd killed 468 process(es) in this unit.
+```
+
+另一次失败同样发生在 step 5000 checkpoint 写入阶段，并有：
+
+```text
+systemd-oomd killed 436 process(es) in this unit.
+```
+
+**原因**：这不是 dataset/video 读取问题，也不是磁盘空间不足。Orbax 保存 checkpoint 时会把 JAX 参数和 train state 搬到 host memory 并写盘，造成系统内存瞬时峰值。训练常驻内存、dataloader workers、视频解码预取、JAX/XLA buffers、wandb、桌面/terminal 进程和 checkpoint host-copy buffer 叠加后，触发了 `systemd-oomd`。如果训练是在 GUI terminal/VTE scope 里启动，`systemd-oomd` 会杀掉整个 `vte-spawn-...scope`，里面的 tmux server 也会一起死。
+
+一次成功 checkpoint 的日志显示写入量大约是：
+
+```text
+params: 7.2 GiB
+train_state: 3.5 GiB
+```
+
+实际保存过程的 RAM 峰值会高于写盘体积。没有 swap 时风险更高。
+
+**排查**：
+
+```bash
+free -h
+journalctl --user --since '2026-06-08 01:15:00' --until '2026-06-08 01:30:00' --no-pager | rg 'systemd-oomd|vte-spawn'
+ls -lah checkpoints/<config_name>/<exp_name>/
+find checkpoints/<config_name>/<exp_name> -maxdepth 2 -type d -name '*orbax-checkpoint-tmp*'
+```
+
+如果 checkpoint 目录只留下 `5000.orbax-checkpoint-tmp-*`，没有最终 `5000/`，说明保存还没 finalize 就被杀了。
+
+**解决**：
+
+1. 添加 swap。64GB 是最低建议，磁盘空间充足时可以用 128GB：
+
+```bash
+sudo fallocate -l 64G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -h
+```
+
+需要重启后保留 swap 时写入 `/etc/fstab`：
+
+```bash
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+2. 降低 dataloader workers。默认是 `6`，建议先用 `2`，折中可用 `4`：
+
+```bash
+--num-workers 2
+```
+
+3. 重新训练时使用 `--overwrite`，不要从未完成的 `.orbax-checkpoint-tmp-*` 目录恢复。
+
+4. 启动前确认 GPU driver 正常：
+
+```bash
+nvidia-smi
+```
+
+5. 如果加 swap 和降低 workers 后仍在 checkpoint 阶段 OOM，下一步应改 checkpoint 策略，只保存 LoRA/trainable params，而不是完整 base model params/train state。
+
 ## wandb login 失败：API key must be 40 characters long
 
 **问题**：`wandb login` 粘贴 API key 后报错 `ValueError: API key must be 40 characters long, yours was 86`。
