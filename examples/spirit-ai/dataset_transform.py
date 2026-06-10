@@ -17,6 +17,12 @@ Examples:
         --output_dir /path/to/output_dataset \
         --global_prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
         --slice-episodes
+
+    uv run python examples/spirit-ai/dataset_transform.py merge-datasets \
+        --base_dir /path/to/base_dataset \
+        --supplement_dir /path/to/supplement_dataset \
+        --output_dir /path/to/merged_dataset \
+        --supplement_repeat 2
 """
 
 from __future__ import annotations
@@ -282,6 +288,32 @@ def run_verify_video_sync(args: argparse.Namespace) -> None:
     print("PASS - Video sync checks passed.")
 
 
+def run_merge_datasets(args: argparse.Namespace) -> None:
+    from utils import dataset_merger
+
+    summary = dataset_merger.merge_datasets(
+        base_dir=Path(args.base_dir).resolve(),
+        supplement_dir=Path(args.supplement_dir).resolve(),
+        output_dir=Path(args.output_dir).resolve(),
+        supplement_repeat=args.supplement_repeat,
+        overwrite=args.overwrite,
+        progress=not args.quiet,
+    )
+    print(f"Output dataset:       {summary.output_dir}")
+    print(f"Total episodes:       {summary.total_episodes}")
+    print(f"Total frames:         {summary.total_frames}")
+    print(f"Total tasks:          {summary.total_tasks}")
+    print(f"Base episodes:        {summary.base_episodes}")
+    print(f"Base frames:          {summary.base_frames}")
+    print(f"Supplement repeat:    {summary.supplement_repeat}")
+    print(f"Supplement episodes:  {summary.supplement_episodes}")
+    print(f"Supplement frames:    {summary.supplement_frames}")
+    if summary.total_frames:
+        fraction = summary.supplement_frames / summary.total_frames
+        print(f"Supplement fraction:  {fraction:.2%}")
+    print("Done.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -357,6 +389,24 @@ def build_parser() -> argparse.ArgumentParser:
     verify_video.add_argument("--max-issues", "--max_issues", dest="max_issues", type=int, default=None)
     verify_video.add_argument("--quiet", action="store_true", help="Disable progress messages.")
 
+    merge = subparsers.add_parser(
+        "merge-datasets",
+        help="Merge a base dataset with a repeated supplement dataset into a standalone copy.",
+    )
+    merge.add_argument("--base-dir", "--base_dir", dest="base_dir", required=True)
+    merge.add_argument("--supplement-dir", "--supplement_dir", dest="supplement_dir", required=True)
+    merge.add_argument("--output-dir", "--output_dir", dest="output_dir", required=True)
+    merge.add_argument(
+        "--supplement-repeat",
+        "--supplement_repeat",
+        dest="supplement_repeat",
+        type=int,
+        default=1,
+        help="Number of times to append the supplement dataset.",
+    )
+    merge.add_argument("--quiet", action="store_true", help="Disable merge progress messages.")
+    merge.add_argument("--overwrite", action="store_true")
+
     return parser
 
 
@@ -377,6 +427,8 @@ def main(argv: list[str] | None = None) -> None:
         run_build_multiscale(args)
     elif args.command == "verify-video-sync":
         run_verify_video_sync(args)
+    elif args.command == "merge-datasets":
+        run_merge_datasets(args)
     else:
         parser.error(f"Unknown command: {args.command}")
 
