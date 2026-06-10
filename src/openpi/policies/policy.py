@@ -65,7 +65,14 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        rtc: dict | None = None,
+        return_model_actions: bool = False,
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -87,6 +94,29 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        # RTC (Real-Time Chunking) guidance parameters
+        if rtc is not None:
+            rtc_target = rtc.get("target")
+            rtc_mask = rtc.get("mask")
+            if rtc_target is not None:
+                if self._is_pytorch_model:
+                    sample_kwargs["rtc_target"] = torch.from_numpy(np.asarray(rtc_target)).to(self._pytorch_device)
+                else:
+                    rtc_target_arr = jnp.asarray(rtc_target)
+                    if rtc_target_arr.ndim == 2:
+                        rtc_target_arr = rtc_target_arr[None, ...]
+                    sample_kwargs["rtc_target"] = rtc_target_arr
+            if rtc_mask is not None:
+                if self._is_pytorch_model:
+                    sample_kwargs["rtc_mask"] = torch.from_numpy(np.asarray(rtc_mask)).to(self._pytorch_device)
+                else:
+                    rtc_mask_arr = jnp.asarray(rtc_mask)
+                    if rtc_mask_arr.ndim == 1:
+                        rtc_mask_arr = rtc_mask_arr[None, ...]
+                    sample_kwargs["rtc_mask"] = rtc_mask_arr
+            if "beta" in rtc:
+                sample_kwargs["rtc_beta"] = float(rtc["beta"])
+
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
@@ -99,7 +129,12 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        model_actions = np.asarray(outputs["actions"]) if return_model_actions else None
         outputs = self._output_transform(outputs)
+        if return_model_actions:
+            # This is the raw model action space before output transforms such as
+            # SpiritAI's 32D -> 25D truncation. RTC targets must use this space.
+            outputs["model_actions"] = model_actions
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

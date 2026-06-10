@@ -600,7 +600,67 @@ Bridge parameters most often tuned during deployment:
 
 Start with short runs (`--max-steps 3` to `10`). If `limited_fraction` is already around `0.45-0.60`, the bridge is materially changing the policy output; do not keep lowering velocity blindly.
 
-## 7. Architecture Reference
+## 7. RTC (Real-Time Chunking) Deployment
+
+RTC adds replacement-style inpainting guidance in model action space to improve temporal consistency between consecutive action chunks. It is **experimental and disabled by default**.
+
+### Key properties
+
+- **No retraining required** - RTC operates at inference time using `return_model_actions` and the soft-mask inpainting target.
+- **JAX pi0/pi0.5 only** - The PyTorch inference path currently rejects `rtc` kwargs.
+- **Replacement inpainting, not full VJP guidance** - The current implementation shifts the previous model-space chunk and applies a soft mask (Eq. 5 from arXiv 2506.07339). Full VJP/GDM guidance is not yet implemented.
+- **Uses existing prefetch/chunk loop** - RTC does not add a background inference thread; it piggybacks on the standard `--prefetch-next-chunk` mechanism.
+- **Keep safety limits enabled** - RTC does not bypass motion limits, blend steps, or rollback suppression.
+
+### Recommended starter flags
+
+For the h50 multiscale Cartesian policy:
+
+```bash
+uv run python examples/spirit-ai/main.py \
+    --policy-host localhost \
+    --policy-port 8000 \
+    --robot-url ws://THOR_IP:8766 \
+    --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
+    --policy-action-layout cartesian \
+    --execute-steps 15 \
+    --enable-rtc \
+    --rtc-s-min 5 \
+    --rtc-beta 0.8 \
+    --rtc-model-action-horizon 50 \
+    --rtc-model-action-dim 32 \
+    --enable-external-following \
+    --source-hz 15 \
+    --blend-steps 4 \
+    --prefetch-next-chunk \
+    --prefetch-delay-fraction 0.85 \
+    --max-cart-translation-m-s 0.08 \
+    --max-cart-rotation-rad-s 0.35 \
+    --max-gripper-velocity-s 0.8 \
+    --max-base-speed 0.05 \
+    --max-steps 20
+```
+
+### RTC parameters
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--enable-rtc` | `False` | Enable replacement-inpainting RTC guidance |
+| `--rtc-s-min` | `5` | Minimum free (unconstrained) steps at the tail of each chunk |
+| `--rtc-beta` | `0.8` | Guidance strength multiplier |
+| `--rtc-initial-delay-steps` | `1` | Number of initial inferences without guidance |
+| `--rtc-model-action-horizon` | `50` | Model action horizon (must match training config) |
+| `--rtc-model-action-dim` | `32` | Model action dimension (must match training config) |
+
+### Local testing note
+
+If ROS pytest plugins interfere with running the RTC unit tests locally, disable plugin autoloading:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run python -m pytest src/openpi/rtc/rtc_test.py -q
+```
+
+## 8. Architecture Reference
 
 Important files:
 

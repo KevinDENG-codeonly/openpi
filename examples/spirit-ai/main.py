@@ -11,6 +11,19 @@ import websockets.sync.client
 from openpi.policies import spiritai_bridge
 
 
+@dataclasses.dataclass(frozen=True)
+class PolicyChunk:
+    """Result of a single policy inference call.
+
+    Attributes:
+        actions: Robot-facing output actions from policy, shape (T, action_dim).
+        model_actions: Pre-output-transform actions in model space when RTC is enabled, or None.
+    """
+
+    actions: np.ndarray
+    model_actions: np.ndarray | None = None
+
+
 @dataclasses.dataclass
 class Args:
     policy_host: str = "localhost"
@@ -43,6 +56,16 @@ class Args:
     gripper_initial_tolerance: float = 0.00965
     gripper_reset_command_state: float = 1.0
     gripper_reset_steps: int = 10
+    # RTC (Real-Time Chunking) flags - default disabled
+    enable_rtc: bool = False
+    rtc_s_min: int = 5
+    rtc_beta: float = 0.8
+    rtc_initial_delay_steps: int = 1
+    # Model action space dimensions for RTC target construction.
+    # Must match the model's action_dim (32 for pi05_spiritai_cart_lora_h50_multiscale).
+    # RTC guidance operates in model action space before output transform.
+    rtc_model_action_dim: int = 32
+    rtc_model_action_horizon: int = 50
 
 
 def _wait_until_robot_idle(robot_ws: websockets.sync.client.ClientConnection, busy_sleep_s: float) -> None:
@@ -149,19 +172,26 @@ def _send_initial_gripper_reset(
     )
 
 
-def _infer_policy_actions(
+def _infer_policy_chunk(
     policy: _websocket_client_policy.WebsocketClientPolicy,
     obs: dict,
     images: dict,
     *,
     prompt: str,
     policy_action_layout: Literal["joint", "cartesian"],
-) -> object:
+    rtc: dict | None = None,
+    return_model_actions: bool = False,
+) -> PolicyChunk:
+    """Run a single policy inference and return a PolicyChunk."""
     if policy_action_layout == "cartesian":
         policy_obs = spiritai_bridge.map_robot_server_cartesian_observation(obs, images, prompt=prompt)
     else:
         policy_obs = spiritai_bridge.map_robot_server_observation(obs, images, prompt=prompt)
-    return policy.infer(policy_obs)["actions"]
+    result = policy.infer(policy_obs, rtc=rtc, return_model_actions=return_model_actions)
+    return PolicyChunk(
+        actions=result["actions"],
+        model_actions=result.get("model_actions") if return_model_actions else None,
+    )
 
 
 def main(args: Args) -> None:
@@ -290,7 +320,30 @@ def main(args: Args) -> None:
 
         previous_state = None
         previous_commands = None
-        prefetched_actions = None
+        prefetched_chunk: PolicyChunk | None = None
+
+        # RTC state controller (only active when --enable-rtc is set).
+        # This is replacement-style inpainting in model action space, not full
+        # VJP/GDM guidance. It relies on the existing prefetch/chunk loop.
+        rtc_state = None
+        if args.enable_rtc:
+            from openpi.rtc.state import RTCState
+
+            rtc_state = RTCState(
+                action_horizon=args.rtc_model_action_horizon,
+                action_dim=args.rtc_model_action_dim,
+                s_min=args.rtc_s_min,
+                beta=args.rtc_beta,
+                initial_delay_steps=args.rtc_initial_delay_steps,
+            )
+            logging.info(
+                "RTC enabled: s_min=%d beta=%.2f initial_delay=%d model_dims=(%d,%d)",
+                args.rtc_s_min,
+                args.rtc_beta,
+                args.rtc_initial_delay_steps,
+                args.rtc_model_action_horizon,
+                args.rtc_model_action_dim,
+            )
         for step in range(args.max_steps):
             _wait_until_robot_idle(robot_ws, args.busy_sleep_s)
             obs, images = _get_robot_obs(robot_ws)
@@ -312,26 +365,48 @@ def main(args: Args) -> None:
                     ),
                 )
 
-            if prefetched_actions is None:
+            if prefetched_chunk is None:
+                # Build RTC kwargs if controller is active
+                rtc_kwargs = rtc_state.get_rtc_kwargs() if rtc_state is not None else None
                 inference_start_s = time.perf_counter()
-                raw_actions = _infer_policy_actions(
+                chunk = _infer_policy_chunk(
                     policy,
                     obs,
                     images,
                     prompt=args.prompt,
                     policy_action_layout=args.policy_action_layout,
+                    rtc=rtc_kwargs,
+                    return_model_actions=rtc_state is not None,
                 )
                 inference_latency_s = time.perf_counter() - inference_start_s
                 logging.info("Step %d policy inference latency: %.3fs", step, inference_latency_s)
             else:
-                raw_actions = prefetched_actions
-                prefetched_actions = None
+                chunk = prefetched_chunk
+                prefetched_chunk = None
                 logging.info("Step %d using prefetched policy actions", step)
 
+            # Update RTC state with the new model-space actions. Policy outputs
+            # may be truncated for robot commands, so use the explicit pre-output
+            # transform model_actions field.
+            if rtc_state is not None:
+                model_actions_arr = np.asarray(chunk.model_actions) if chunk.model_actions is not None else None
+                if model_actions_arr is not None and model_actions_arr.shape == (
+                    rtc_state.action_horizon,
+                    rtc_state.action_dim,
+                ):
+                    rtc_state.update_after_inference(model_actions_arr)
+                else:
+                    logging.warning(
+                        "RTC: model_actions shape %s != expected (%d,%d); skipping RTC state update.",
+                        None if model_actions_arr is None else model_actions_arr.shape,
+                        rtc_state.action_horizon,
+                        rtc_state.action_dim,
+                    )
+
             if args.policy_action_layout == "cartesian":
-                commands = spiritai_bridge.spiritai_cartesian_actions_to_cartesian_commands(raw_actions, command_dim)
+                commands = spiritai_bridge.spiritai_cartesian_actions_to_cartesian_commands(chunk.actions, command_dim)
             else:
-                commands = spiritai_bridge.spiritai_actions_to_joint_commands(raw_actions, command_dim)
+                commands = spiritai_bridge.spiritai_actions_to_joint_commands(chunk.actions, command_dim)
             if args.execute_steps is not None:
                 commands = commands[: args.execute_steps]
             if commands.shape[0] > max_chunk:
@@ -421,6 +496,10 @@ def main(args: Args) -> None:
             previous_state = current_state
             previous_commands = commands
 
+            # Mark consumed steps for RTC state
+            if rtc_state is not None:
+                rtc_state.mark_consumed(commands.shape[0])
+
             if args.prefetch_next_chunk and step + 1 < args.max_steps:
                 expected_finish_at = ack.get("expected_finish_at")
                 if isinstance(expected_finish_at, int | float):
@@ -429,13 +508,16 @@ def main(args: Args) -> None:
                     if delay_s > 0:
                         time.sleep(delay_s)
                 prefetch_obs, prefetch_images = _get_robot_obs(robot_ws)
+                prefetch_rtc_kwargs = rtc_state.get_rtc_kwargs() if rtc_state is not None else None
                 prefetch_start_s = time.perf_counter()
-                prefetched_actions = _infer_policy_actions(
+                prefetched_chunk = _infer_policy_chunk(
                     policy,
                     prefetch_obs,
                     prefetch_images,
                     prompt=args.prompt,
                     policy_action_layout=args.policy_action_layout,
+                    rtc=prefetch_rtc_kwargs,
+                    return_model_actions=rtc_state is not None,
                 )
                 prefetch_latency_s = time.perf_counter() - prefetch_start_s
                 logging.info("Step %d prefetch policy inference latency: %.3fs", step, prefetch_latency_s)
