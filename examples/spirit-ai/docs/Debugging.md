@@ -1,5 +1,81 @@
 # Debugging Notes
 
+## `robot_server` Container Is Up but Port 8766 Refuses Connections
+
+**Symptom:** `run_robot.sh` starts the container on MOZ1, and `docker ps` shows `robot_server` as `Up`. The logs may already show:
+
+```text
+Robot structure: wholebody
+MozRobot subscribing to /cart_states, /gripper_states, /mx_tactile_state, /robot_states
+Action queue thread started
+Robot is alive and responding
+```
+
+But the websocket port is not reachable from Precision or from MOZ1 itself:
+
+```bash
+nc -vz 172.16.0.30 8766
+nc -vz 127.0.0.1 8766
+```
+
+The error is:
+
+```text
+Connection refused
+```
+
+On MOZ1, the port is not listening:
+
+```bash
+ss -ltnp | grep 8766
+```
+
+`docker inspect` may still show that the container is using host networking:
+
+```text
+host {}
+```
+
+This means the issue is not Docker port publishing. The process inside the container has not successfully reached the websocket listen step.
+
+**Cause:** the `robot_server` container can be running while lower-level robot ROS2/SDK services are not fully ready. In that state, the server may block or fail during initialization before binding `0.0.0.0:8766`. Pay particular attention to `/cart_states` and `/gripper_states`; if these topics are missing, the container can appear alive but never become ready for websocket clients.
+
+**Diagnose:**
+
+```bash
+docker logs --tail=200 robot_server
+docker top robot_server -eo pid,ppid,stat,cmd
+ss -ltnp | grep 8766
+nc -vz 127.0.0.1 8766
+ros2 topic list | grep -E '/cart_states|/gripper_states'
+```
+
+If `docker ps` shows the container as `Up`, but `ss` has no `8766` listener and `nc -vz 127.0.0.1 8766` returns `Connection refused`, the websocket server is not ready.
+
+**Fix:** restart the robot so the lower-level ROS2/SDK services come up cleanly. After the robot reboot, restart `robot_server`:
+
+```bash
+cd /home/dengkevin/Documents/code/robot_server_code
+bash run_robot.sh
+docker logs -f robot_server
+```
+
+Then confirm the required topics and websocket port:
+
+```bash
+ros2 topic list | grep -E '/cart_states|/gripper_states'
+ss -ltnp | grep 8766
+nc -vz 127.0.0.1 8766
+```
+
+From Precision, confirm the robot websocket is reachable over the wired link:
+
+```bash
+nc -vz 172.16.0.30 8766
+```
+
+**Verify:** once healthy, Precision should connect to `172.16.0.30:8766`, and the Spirit AI bridge should be able to read robot metadata, `busy=false` status, observation state keys, and camera images before sending any command.
+
 ## TorchCodec Fails on the Last Video Frame in Multiscale Training
 
 **Symptom:** pi0.5 fine-tuning fails in a DataLoader worker with:
