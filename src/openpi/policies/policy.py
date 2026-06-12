@@ -98,24 +98,24 @@ class Policy(BasePolicy):
         if rtc is not None:
             rtc_target = rtc.get("target")
             rtc_mask = rtc.get("mask")
-            if rtc_target is not None:
+            rtc_beta = float(rtc.get("beta", 1.0))
+            if rtc_target is not None and rtc_mask is not None:
                 if self._is_pytorch_model:
                     sample_kwargs["rtc_target"] = torch.from_numpy(np.asarray(rtc_target)).to(self._pytorch_device)
+                    # Precompute weight: clip(beta * mask)[..., None] -> (b, ah, 1)
+                    weight = np.clip(rtc_beta * np.asarray(rtc_mask, dtype=np.float32), 0.0, 1.0)
+                    sample_kwargs["rtc_weight"] = torch.from_numpy(weight).to(self._pytorch_device)
                 else:
                     rtc_target_arr = jnp.asarray(rtc_target)
                     if rtc_target_arr.ndim == 2:
                         rtc_target_arr = rtc_target_arr[None, ...]
                     sample_kwargs["rtc_target"] = rtc_target_arr
-            if rtc_mask is not None:
-                if self._is_pytorch_model:
-                    sample_kwargs["rtc_mask"] = torch.from_numpy(np.asarray(rtc_mask)).to(self._pytorch_device)
-                else:
-                    rtc_mask_arr = jnp.asarray(rtc_mask)
-                    if rtc_mask_arr.ndim == 1:
-                        rtc_mask_arr = rtc_mask_arr[None, ...]
-                    sample_kwargs["rtc_mask"] = rtc_mask_arr
-            if "beta" in rtc:
-                sample_kwargs["rtc_beta"] = float(rtc["beta"])
+                    # Precompute weight: clip(beta * mask)[..., None] -> (b, ah, 1)
+                    rtc_mask_arr = np.clip(rtc_beta * np.asarray(rtc_mask, dtype=np.float32), 0.0, 1.0)
+                    rtc_weight_arr = jnp.asarray(rtc_mask_arr)
+                    if rtc_weight_arr.ndim == 1:
+                        rtc_weight_arr = rtc_weight_arr[None, ...]
+                    sample_kwargs["rtc_weight"] = rtc_weight_arr[..., None]  # (b, ah, 1)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
