@@ -258,32 +258,43 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-        rtc_target: at.Float[at.Array, "b ah ad"] | None = None,
-        rtc_weight: at.Float[at.Array, "b ah 1"] | None = None,
+        rtc_action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_delay_steps: at.Int[at.Array, "b"] | None = None,  # noqa: F821
     ) -> _model.Actions:
-        """Sample actions via flow matching with optional RTC inpainting guidance.
-
-        RTC (Real-Time Chunking) guidance applies soft inpainting during the denoising loop.
-        At each step, the trajectory is blended toward a target using the precomputed weight.
-        This implements the "replacement inpainting" variant from arXiv 2506.07339 Sec 3.2.
-
-        Args:
-            rtc_target: Target actions in model action space, shape (b, action_horizon, action_dim).
-            rtc_weight: Precomputed blend weight = clip(beta * mask)[..., None], shape (b, ah, 1).
-        """
+        """Sample actions via flow matching with an optional hard RTC action prefix."""
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+
+        if (rtc_action_prefix is None) != (rtc_delay_steps is None):
+            raise ValueError("rtc_action_prefix and rtc_delay_steps must be provided together")
+        if rtc_action_prefix is not None:
+            if not self.pi05:
+                raise ValueError("RTC sampling is only supported for Pi0.5")
+            expected_prefix_shape = (batch_size, self.action_horizon, self.action_dim)
+            if rtc_action_prefix.shape != expected_prefix_shape:
+                raise ValueError(
+                    "rtc_action_prefix must have shape "
+                    f"{expected_prefix_shape}, got {rtc_action_prefix.shape}"
+                )
+            expected_delay_shape = (batch_size,)
+            if rtc_delay_steps.shape != expected_delay_shape:
+                raise ValueError(
+                    "rtc_delay_steps must have shape "
+                    f"{expected_delay_shape}, got {rtc_delay_steps.shape}"
+                )
+            if not isinstance(rtc_delay_steps, jax.core.Tracer) and bool(
+                jnp.any((rtc_delay_steps < 0) | (rtc_delay_steps >= self.action_horizon))
+            ):
+                raise ValueError(
+                    "rtc_delay_steps must satisfy "
+                    f"0 <= delay < action_horizon ({self.action_horizon})"
+                )
+
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-
-        # RTC blending: always execute but with zero weight when disabled (no-op).
-        if rtc_target is None:
-            rtc_target = jnp.zeros_like(noise)
-        if rtc_weight is None:
-            rtc_weight = jnp.zeros((batch_size, self.action_horizon, 1))
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -293,9 +304,14 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
+            if rtc_action_prefix is None:
+                timestep = jnp.broadcast_to(time, batch_size)
+            else:
+                x_t = conditioning.freeze_prefix(x_t, rtc_action_prefix, rtc_delay_steps)
+                timestep = jnp.where(
+                    conditioning.prefix_mask(rtc_delay_steps, self.action_horizon), 0.0, time
+                )
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -325,11 +341,8 @@ class Pi0(_model.BaseModel):
 
             x_next = x_t + dt * v_t
             new_time = time + dt
-
-            # RTC replacement inpainting: blend x_next toward the target interpolated at new_time.
-            # When rtc_weight is all-zeros (no RTC), this is a no-op.
-            x_target_t = new_time * noise + (1.0 - new_time) * rtc_target
-            x_next = (1.0 - rtc_weight) * x_next + rtc_weight * x_target_t
+            if rtc_action_prefix is not None:
+                x_next = conditioning.freeze_prefix(x_next, rtc_action_prefix, rtc_delay_steps)
 
             return x_next, new_time
 
@@ -339,4 +352,6 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        if rtc_action_prefix is not None:
+            x_0 = conditioning.freeze_prefix(x_0, rtc_action_prefix, rtc_delay_steps)
         return x_0
