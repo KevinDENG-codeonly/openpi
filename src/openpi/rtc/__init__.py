@@ -1,10 +1,8 @@
-"""Real-Time Chunking (RTC) support for openpi.
+"""Training-time real-time chunking scheduling support for OpenPI.
 
-Reference: arXiv 2506.07339, "Real-Time Execution of Action Chunking Flow Policies".
-
-RTC implements inference-time asynchronous action chunking with inpainting guidance
-during flow/diffusion denoising. It modifies the flow sampling loop to guide the
-denoised trajectory toward consistency with previously committed actions.
+The model sampler uses hard action-prefix conditioning learned during training.
+This package provides the deterministic runtime timeline; legacy inference-time
+replacement, soft-mask, and VJP guidance are intentionally unavailable.
 """
 
 from openpi.rtc.timeline import ActionPlan

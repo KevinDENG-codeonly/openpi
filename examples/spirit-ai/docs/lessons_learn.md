@@ -1,109 +1,83 @@
-# Lessons Learned: Real-Time Inference on Spirit AI Moz1
+# Lessons Learned: Training-Time RTC on Spirit AI Moz1
 
-This document captures practical insights from deploying pi05 VLA models on the Spirit AI Moz1 humanoid robot with Real-Time Chunking (RTC). It is intended to help anyone reproducing or extending this work understand the tradeoffs involved, even without prior experience on this platform.
+This document records operating guidance for the current SpiritAI training-time
+RTC runner. Earlier replacement-inpainting notes are intentionally removed: they
+describe a retired implementation and must not be used to tune a deployed robot.
 
----
+## Current RTC model and runtime
 
-## Background
+RTC requires a JAX Pi0.5 checkpoint trained with `rtc_training.enabled`. Its policy
+metadata must advertise `rtc_capabilities.algorithm: training_time_v1`; the runtime
+uses that metadata, rather than human-entered dimensions, to validate the model
+action horizon, action dimension, and maximum trained delay.
 
-The pi05 model predicts actions in chunks — a single forward pass outputs 50 timesteps of future actions (the "action horizon"). The robot then executes these actions open-loop before re-observing and replanning. This creates a fundamental tension: longer chunks give the model more temporal context, but the robot is "blind" during execution and cannot react to unexpected environment changes until the next inference call.
+Sampling is hard action-prefix conditioning. The next plan receives the already
+committed raw model-action prefix while the model generates its postfix. There is
+no VJP/PiGDM, `beta`, soft mask, replacement inpainting, or legacy RTC mode to tune.
+The prefix remains in model space; one robot-facing action is independently mapped,
+limited, and dispatched by the main control thread on each accepted tick.
 
-Our system runs on the following setup:
-- **Model**: pi05_spiritai_cart_lora_h50 (action_horizon=50, action_dim=32, Cartesian control)
-- **Training data**: collected at 30Hz
-- **Inference latency**: ~82ms end-to-end client round-trip (4ms model forward pass; the rest is image preprocessing and network transfer)
-- **Robot control**: 500Hz servo loop with PCHIP interpolation from the policy's waypoint rate up to 120Hz
+## YAML-only deployment
 
----
+Run the source-relative default profile with:
 
-## Real-Time Chunking (RTC)
-
-### The Problem It Solves
-
-Without RTC, each action chunk is sampled independently. Even if consecutive chunks start from the same observation, stochasticity in the flow matching process means their predictions can disagree at the boundary — leading to visible jitter, directional reversals, and oscillation. This gets worse as `execute_steps` decreases (more frequent replanning = more boundaries).
-
-### How It Works
-
-RTC modifies the flow matching denoising loop (which iteratively refines noise into a clean action trajectory). After each Euler integration step, RTC blends the intermediate result toward a "target" — the portion of the previous chunk that hasn't been executed yet, shifted to align with the new chunk's timeline. The blending strength is controlled by a soft mask that is strongest for the already-committed region and decays toward zero at the tail of the chunk.
-
-The key parameters are:
-- **`rtc_beta`** (0 to 1): Global blending strength. Higher values force the new chunk to stay closer to the previous one. Setting this to 0.9 almost eliminates boundary jitter but makes the model slower to react to environment changes.
-- **`rtc_s_min`**: Minimum number of unconstrained (free) steps at the tail of each chunk. These steps have zero mask weight, giving the model full freedom to plan new behavior. Larger values make the model more responsive but reduce smoothness guarantees.
-
-In practice, `rtc_beta=0.9` with `rtc_s_min=5` provides strong inter-chunk consistency while still allowing the model to adapt within ~170ms (5 steps at 30Hz).
-
-### Implementation Note: JAX JIT Compatibility
-
-The `rtc_beta` parameter must be multiplied into the mask outside of the JIT-traced function. If passed as a raw float kwarg into `sample_actions`, JAX will trace it and raise a `TracerBoolConversionError` when switching between RTC-enabled and RTC-disabled calls. The fix is to precompute `rtc_weight = clip(beta * mask)[..., None]` in numpy before passing it to the model as a static-shape array.
-
----
-
-## Velocity Limiting and the `limited_fraction` Metric
-
-### What It Means
-
-The system applies per-step velocity capping before sending commands to the robot. `limited_fraction` reports what proportion of steps in each chunk had their velocity reduced. For example, `limited_fraction=0.5` means half of the predicted actions were moving faster than allowed and got clamped.
-
-### Why It Matters
-
-High `limited_fraction` (above ~0.3) indicates that the executed trajectory is materially different from what the model predicted. This causes a feedback loop:
-1. The model predicts a trajectory to reach position X in 50 steps.
-2. Velocity clamping slows the motion, so the robot only reaches position Y after 50 steps.
-3. On the next observation, the model sees it hasn't arrived and predicts an aggressive correction.
-4. The correction gets clamped again → persistent oscillation / jitter.
-
-Additionally, velocity clamping is applied per-dimension. If only some joints exceed the limit, the coordinated multi-joint trajectory gets distorted (e.g., a straight-line Cartesian motion becomes curved).
-
-### Tuning Guidance
-
-The goal is to keep `limited_fraction` below 0.15. In our testing, the following limits achieve this while remaining safe for the hardware:
-
-```
---max-cart-translation-m-s 0.10
---max-cart-rotation-rad-s 0.30
---max-torso-cart-translation-m-s 0.05
---max-torso-cart-rotation-rad-s 0.20
+```bash
+uv run examples/spirit-ai/main.py --dry-run
 ```
 
-If `limited_fraction` is consistently high, the correct fix is to raise velocity limits — not to lower `source_hz`, which would create a mismatch with the training data timescale.
+Use `--config PATH` to select another strict profile. The YAML config owns policy
+and robot endpoints, action layout, motion limits, `source_hz`, delay scheduling,
+and all timeout values. `--dry-run` suppresses every robot command and is required
+for a new profile before an operator-authorized low-speed hardware run.
 
----
+Do not restore old per-run RTC, prefetch, or chunk-execution flags. The runtime has
+one policy inference in flight and one robot command per control tick; it does not
+use the former synchronous prefetch loop.
 
-## Choosing `source_hz`
+## Transport, latency, and timeouts
 
-`source_hz` defines the temporal spacing between the policy's output waypoints. The robot-side interpolator upsamples these to 120Hz for smooth servo execution. This parameter should match the training data sampling rate (30Hz in our case) because the model learned its dynamics at that timescale. Setting `source_hz` too high makes the model extrapolate between timesteps it never saw during training; too low makes it skip frames, producing larger per-step deltas that are more likely to hit velocity limits.
+The RTC profile requires non-TLS `ws://` robot and policy endpoints. Linux total
+write-deadline enforcement depends on `MSG_DONTWAIT` for each socket send; Python
+TLS sockets cannot safely provide that guarantee, so `wss://` is rejected before
+policy or robot hardware activity.
 
-With RTC enabled, `source_hz` can be set more aggressively than without, because RTC handles the chunk-boundary discontinuities that previously limited higher rates. However, exceeding 2× the training rate is not recommended.
+Measure end-to-end policy and robot latency at the intended `control.source_hz`
+before training and deployment. Choose training `max_delay_steps` and runtime
+`rtc.delay.planned_max_steps` from the same measured safe range. The default values
+are templates, not a latency result.
 
----
+The profile bounds policy connection attempts (`policy.connect_timeout_s`), bootstrap
+and initial inference waits (`rtc.initial_inference_timeout_s`), robot RPC responses,
+commands, and writes (`control.command_ack_timeout_s`), and total busy-status waits
+(`control.robot_idle_timeout_s`). Timeout, deadline, and RPC-budget failures fail
+closed: scheduling stops, transports close, and the configured terminal one-row hold
+is dispatched before stopping when that is safe to do.
 
-## Prefetch and Observation Freshness
+## Motion safety and diagnostics
 
-The main inference loop uses prefetching to overlap computation with execution:
+Motion limits, blend, and rollback suppression remain part of the YAML safety
+profile. Tune them only after dry-run validation and a measured low-speed test; a
+large command delta at a plan switch means the physical command is diverging from
+the intended plan and should be investigated rather than masked with a retired RTC
+parameter.
 
-1. A chunk of `execute_steps` actions is sent to the robot (e.g., 5 steps = 167ms at 30Hz).
-2. Partway through execution (controlled by `prefetch_delay_fraction`), a new observation is captured and inference begins.
-3. By the time the current chunk finishes, the next chunk is already computed and can be sent immediately.
+For every RTC experiment, report:
 
-This means the effective observation delay is not `execute_steps / source_hz` (167ms) but approximately `execute_steps / source_hz × prefetch_delay_fraction` (~83ms with fraction=0.5). Reducing `execute_steps` below 3 provides marginal improvement in freshness but increases chunk-boundary artifacts and gives the velocity limiter less trajectory to work with.
+- `dplan` and `dactual`;
+- deadline misses and holds;
+- command delta at plan switches;
+- achieved control frequency; and
+- end-to-end inference latency.
 
----
+These metrics, together with task outcome and safety-limit observations, are the
+comparison basis for ordinary and RTC-trained checkpoints.
 
-## Anti-Jitter Mechanisms
+## Quick reference: symptom → safe next step
 
-Beyond RTC, the system provides several mechanisms to suppress motion artifacts:
-
-- **Blend steps** (`--blend-steps 4`): The first N steps of each chunk are linearly interpolated between the robot's current state and the predicted trajectory. This eliminates instantaneous jumps at chunk start.
-- **Rollback guard** (`--rollback-guard-steps 6`, `--rollback-scale 0.1`): Detects when the first N steps of a new chunk move backward relative to the previous chunk's direction, and suppresses that motion to 10% of its original magnitude. This prevents the oscillation pattern where the model alternates between "overshoot" and "correct back."
-
----
-
-## Quick Reference: Symptom → Action
-
-| Symptom | Likely cause | Adjustment |
-|---------|-------------|------------|
-| Fine jitter / vibration | Velocity limits too tight, or weak RTC | Raise velocity limits until `limited_fraction` < 0.15; raise `rtc_beta` toward 0.9 |
-| Sluggish or fails to reach target | Velocity limits too tight, or RTC over-constraining | Raise velocity limits; lower `rtc_beta`; increase `execute_steps` |
-| Reversal at chunk boundaries | Model predicts conflicting directions across chunks | Lower `rollback-scale` (e.g., 0.1); raise `rollback-guard-steps` |
-| Model ignores environment changes | RTC too strong or `execute_steps` too large | Lower `rtc_beta`; raise `rtc_s_min`; reduce `execute_steps` |
-| `limited_fraction` consistently > 0.3 | Velocity caps too conservative | Raise `max-cart-*` limits (do NOT lower `source_hz`) |
+| Symptom | Safe next step |
+|---------|----------------|
+| Policy metadata rejects the profile | Confirm the checkpoint was trained with `rtc_training.enabled` and the planned delay does not exceed its advertised capability. |
+| Deadline misses or repeated holds | Measure latency again; reduce `source_hz` or use a profile whose training and planned delays match the observed system. |
+| Robot RPC budget violation | Investigate robot/server/network latency before resuming; do not increase a retired prefetch or guidance setting. |
+| Large switch command delta | Review motion limits, blend, rollback suppression, and data/model behavior using a low-speed run. |
+| TLS endpoint configured | Change both relevant RTC endpoints to `ws://`; WSS is intentionally rejected for total write-deadline safety. |

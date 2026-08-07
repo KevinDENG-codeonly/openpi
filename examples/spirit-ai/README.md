@@ -534,123 +534,68 @@ uv run python scripts/serve_policy.py policy:checkpoint \
 
 ### 6.4 Run the Bridge
 
-Joint policy example:
+The bridge is a training-time RTC runner. Its default profile is source-relative:
+`examples/spirit-ai/configs/rtc/training_time.yaml`. The profile contains the policy
+endpoint, robot endpoint, action layout, safety limits, timing, and RTC scheduler
+settings; the command line deliberately does not expose the former long list of
+per-run RTC and motion flags.
 
 ```bash
 cd /home/dengkevin/Documents/code/openpi
-uv run python examples/spirit-ai/main.py \
-    --policy-host localhost \
-    --policy-port 8000 \
-    --robot-url ws://THOR_IP:8766 \
-    --prompt "fold the paper box" \
-    --enable-external-following \
-    --startup-delay-s 10 \
-    --source-hz 15 \
-    --blend-steps 4 \
-    --rollback-guard-steps 4 \
-    --rollback-scale 0.2 \
-    --max-arm-velocity-rad-s 0.35 \
-    --max-torso-velocity-rad-s 0.2 \
-    --max-gripper-velocity-s 0.8 \
-    --max-base-speed 0.05 \
-    --prefetch-next-chunk \
-    --prefetch-delay-fraction 0.85 \
-    --max-steps 5
+uv run examples/spirit-ai/main.py --dry-run
 ```
 
-Cartesian policy example. Execute only a prefix of long predicted chunks and replan frequently:
+Use a different strict YAML profile with `--config PATH`:
 
 ```bash
-cd /home/dengkevin/Documents/code/openpi
-uv run python examples/spirit-ai/main.py \
-    --policy-host localhost \
-    --policy-port 8000 \
-    --robot-url ws://THOR_IP:8766 \
-    --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
-    --policy-action-layout cartesian \
-    --execute-steps 15 \
-    --enable-external-following \
-    --startup-delay-s 10 \
-    --source-hz 15 \
-    --blend-steps 4 \
-    --rollback-guard-steps 4 \
-    --rollback-scale 0.2 \
-    --max-cart-translation-m-s 0.08 \
-    --max-cart-rotation-rad-s 0.35 \
-    --max-torso-cart-translation-m-s 0.04 \
-    --max-torso-cart-rotation-rad-s 0.2 \
-    --max-gripper-velocity-s 0.8 \
-    --max-base-speed 0.05 \
-    --no-prefetch-next-chunk \
-    --max-steps 3
+uv run examples/spirit-ai/main.py --config PATH --dry-run
 ```
 
-Bridge parameters most often tuned during deployment:
-
-| Parameter | Role |
-|-----------|------|
-| `--policy-action-layout` | `joint` for 27D policy outputs, `cartesian` for 25D outputs |
-| `--execute-steps` | Prefix length executed from each policy chunk |
-| `--source-hz` | Action chunk frequency sent to `robot_server` |
-| `--blend-steps` | Blend initial frames toward current robot state |
-| `--rollback-guard-steps` / `--rollback-scale` | Suppress chunk-start rollback |
-| `--prefetch-next-chunk` | Run the next policy inference while current chunk executes |
-| `--max-arm-velocity-rad-s` / `--max-cart-translation-m-s` | Main motion clamps |
-| `--max-base-speed` | Clamp base command dimensions |
-
-Start with short runs (`--max-steps 3` to `10`). If `limited_fraction` is already around `0.45-0.60`, the bridge is materially changing the policy output; do not keep lowering velocity blindly.
+`--dry-run` suppresses every robot command; it is the required first step after
+validating a new profile and policy capability metadata. Remove it only for an
+operator-approved low-speed hardware run.
 
 ## 7. RTC (Real-Time Chunking) Deployment
 
-RTC adds replacement-style inpainting guidance in model action space to improve temporal consistency between consecutive action chunks. It is **experimental and disabled by default**.
+RTC requires a **JAX Pi0.5 checkpoint trained with `rtc_training.enabled`**. The
+policy metadata must advertise `rtc_capabilities.algorithm: training_time_v1`;
+the runner derives its model horizon and dimension from that metadata and rejects a
+profile whose planned delay exceeds the trained capability.
 
-### Key properties
+Sampling is hard action-prefix conditioning only. VJP/PiGDM, `beta`, soft masks,
+replacement inpainting, and every other legacy RTC mode are unavailable. The
+single-flight policy worker builds prefixes in raw model-action space while the
+main thread sends exactly one independently safety-limited robot action per tick.
 
-- **No retraining required** - RTC operates at inference time using `return_model_actions` and the soft-mask inpainting target.
-- **JAX pi0/pi0.5 only** - The PyTorch inference path currently rejects `rtc` kwargs.
-- **Replacement inpainting, not full VJP guidance** - The current implementation shifts the previous model-space chunk and applies a soft mask (Eq. 5 from arXiv 2506.07339). Full VJP/GDM guidance is not yet implemented.
-- **Uses existing prefetch/chunk loop** - RTC does not add a background inference thread; it piggybacks on the standard `--prefetch-next-chunk` mechanism.
-- **Keep safety limits enabled** - RTC does not bypass motion limits, blend steps, or rollback suppression.
+Before training, measure end-to-end latency at the intended control frequency. Set
+the training `max_delay_steps` and YAML `rtc.delay.planned_max_steps` to matching
+safe values; do not treat the default values as a hardware measurement.
 
-### Recommended starter flags
+### Transport and timeout safety
 
-For the h50 multiscale Cartesian policy:
+The RTC runner currently requires non-TLS `ws://` endpoints for both the robot and
+policy connections. Linux total write-deadline enforcement uses per-send
+`MSG_DONTWAIT`, which Python TLS sockets cannot support safely; `wss://` is rejected
+before policy or robot hardware activity. This is intentionally fail-closed, not a
+fallback to unbounded writes.
 
-```bash
-uv run python examples/spirit-ai/main.py \
-    --policy-host localhost \
-    --policy-port 8000 \
-    --robot-url ws://THOR_IP:8766 \
-    --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps." \
-    --policy-action-layout cartesian \
-    --execute-steps 15 \
-    --enable-rtc \
-    --rtc-s-min 5 \
-    --rtc-beta 0.8 \
-    --rtc-model-action-horizon 50 \
-    --rtc-model-action-dim 32 \
-    --enable-external-following \
-    --source-hz 15 \
-    --blend-steps 4 \
-    --prefetch-next-chunk \
-    --prefetch-delay-fraction 0.85 \
-    --max-cart-translation-m-s 0.08 \
-    --max-cart-rotation-rad-s 0.35 \
-    --max-gripper-velocity-s 0.8 \
-    --max-base-speed 0.05 \
-    --max-steps 20
-```
+The YAML timeout settings are part of the safety profile:
 
-### RTC parameters
+| YAML field | Bound |
+|------------|-------|
+| `policy.connect_timeout_s` | Each policy socket connection attempt and policy request write |
+| `rtc.initial_inference_timeout_s` | Metadata and initial policy inference waits |
+| `control.command_ack_timeout_s` | Robot RPC responses, command ACKs, and robot writes |
+| `control.robot_idle_timeout_s` | Total wait across repeated busy robot-status responses |
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--enable-rtc` | `False` | Enable replacement-inpainting RTC guidance |
-| `--rtc-s-min` | `5` | Minimum free (unconstrained) steps at the tail of each chunk |
-| `--rtc-beta` | `0.8` | Guidance strength multiplier |
-| `--rtc-initial-delay-steps` | `1` | Number of initial inferences without guidance |
-| `--rtc-model-action-horizon` | `50` | Model action horizon (must match training config) |
-| `--rtc-model-action-dim` | `32` | Model action dimension (must match training config) |
+Configured timeout, deadline, or RPC-budget failures stop scheduling, send the
+configured one-row terminal hold when applicable, and close the transports safely.
+
+### Required run metrics
+
+Report `dplan`, `dactual`, deadline misses, holds, command delta at plan switches,
+control frequency, and end-to-end inference latency. These are required alongside
+task outcomes when comparing ordinary and RTC-trained checkpoints.
 
 ### Local testing note
 

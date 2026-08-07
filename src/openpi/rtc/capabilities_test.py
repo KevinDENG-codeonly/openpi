@@ -237,7 +237,6 @@ def test_policy_passes_only_training_time_rtc_kwargs(monkeypatch) -> None:
     policy = policy_module.Policy(
         FakeModel(),
         metadata={"rtc_capabilities": make_capabilities(_train_config(enabled=True))},
-        sample_kwargs={"rtc_target": "legacy", "rtc_weight": "legacy"},
     )
     observation = {"image": {}, "image_mask": {}, "state": np.zeros(3, dtype=np.float32)}
 
@@ -248,6 +247,19 @@ def test_policy_passes_only_training_time_rtc_kwargs(monkeypatch) -> None:
     assert captured["rtc_action_prefix"].dtype == policy_module.jnp.float32
     assert captured["rtc_delay_steps"].shape == (1,)
     assert captured["rtc_delay_steps"].dtype == policy_module.jnp.int32
+
+
+def test_policy_does_not_silently_discard_legacy_sampling_kwargs(monkeypatch) -> None:
+    class FakeModel:
+        def sample_actions(self, rng, observation):
+            return policy_module.jnp.zeros((1, 4, 3), dtype=policy_module.jnp.float32)
+
+    monkeypatch.setattr(policy_module.nnx_utils, "module_jit", lambda sample_actions: sample_actions)
+    policy = policy_module.Policy(FakeModel(), sample_kwargs={"rtc_target": "legacy"})
+    observation = {"image": {}, "image_mask": {}, "state": np.zeros(3, dtype=np.float32)}
+
+    with pytest.raises(TypeError, match="rtc_target"):
+        policy.infer(observation)
 
 
 def test_pytorch_policy_rejects_valid_training_time_rtc_request() -> None:

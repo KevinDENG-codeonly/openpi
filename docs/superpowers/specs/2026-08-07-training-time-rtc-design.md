@@ -1,9 +1,35 @@
 # Pi0.5 / SpiritAI training-time RTC 设计
 
 **日期：** 2026-08-07
-**状态：** 待 review
+**状态：** 已实现
 **范围：** JAX Pi0.5、SpiritAI Cartesian h=50。
 **术语：** 论文和代码均使用 RTC（Real-Time Chunking）；本文不再使用 RCT。
+**实施计划：** [training-time RTC implementation plan](../plans/2026-08-07-training-time-rtc.md)
+
+## 实施状态与运行约束
+
+本设计已按上述实施计划落地。SpiritAI 运行器只接受训练时启用
+`rtc_training.enabled` 的 JAX Pi0.5 checkpoint；policy metadata 必须声明
+`rtc_capabilities.algorithm: training_time_v1`，并提供模型 horizon、action dim 和
+`training_max_delay_steps`。运行器从 metadata 获取模型维度，拒绝超过训练能力的
+`planned_max_steps`。
+
+在线采样唯一支持 hard action-prefix conditioning。VJP/PiGDM、`beta`、soft mask、
+replacement inpainting 和其他 legacy RTC 路径均不可用。主线程只拥有 robot WebSocket，
+单飞 worker 独占 policy 连接；每个控制 tick 至多发送一个经过安全限制的 robot action。
+
+入口为 `uv run examples/spirit-ai/main.py`，默认读取相对 `main.py` 的 strict YAML profile；
+`--config PATH` 覆盖该路径，`--dry-run` 抑制 command send。运行 RTC profile 时，robot 和
+policy 必须使用非 TLS `ws://` endpoint：Linux total write-deadline 依赖 per-send
+`MSG_DONTWAIT`，Python TLS socket 无法安全支持该机制，因此 `wss://` 会在任何 hardware 或
+policy activity 前被拒绝。
+
+在训练前必须在目标控制频率下测量端到端时延，并让训练
+`max_delay_steps` 与部署 `rtc.delay.planned_max_steps` 采用相同的安全范围。每次运行报告
+`dplan`、`dactual`、deadline misses、holds、plan-switch command delta、control frequency 和
+end-to-end inference latency。YAML 同时配置 policy connection、initial inference、robot RPC
+ACK 和 robot-idle timeout；超时、deadline 或 RPC-budget 失败会 fail closed，关闭 transport，
+并在配置要求时发送一行 terminal hold 后停止。
 
 ## 1. 决策与目标
 
@@ -253,6 +279,7 @@ policy:
   host: localhost
   port: 8000
   prompt: fold the paper box
+  connect_timeout_s: 1.0
 robot:
   url: ws://172.16.0.30:8766
   action_layout: cartesian
@@ -260,10 +287,13 @@ control:
   source_hz: 15.0
   max_steps: 2000
   rpc_budget_fraction: 0.70
+  command_ack_timeout_s: 1.0
+  robot_idle_timeout_s: 10.0
   motion_limits: {}                 # 复用现有 joint/cartesian 限制字段
 rtc:
   mode: training_time
   s_min: 5
+  initial_inference_timeout_s: 10.0
   delay:
     planned_max_steps: 12           # 必须 <= metadata.training_max_delay_steps
     history_window: 16
@@ -274,8 +304,10 @@ rtc:
 ```
 
 `planned_max_steps: 12` 只是 h=50 模板的初始上限；首次训练前应根据真实端到端 profile 将
-训练 `max_delay_steps` 和部署上限设为同一范围。严格 YAML loader 必须拒绝未知键、错误类型、
-不支持的 `mode` 及 metadata 不匹配。
+训练 `max_delay_steps` 和部署上限设为同一范围。严格 YAML loader 拒绝未知键、错误类型、
+不支持的 `mode`、timeout 非正值和 metadata 不匹配。`policy.connect_timeout_s` 小于
+`rtc.initial_inference_timeout_s`，这样一次 socket connect 不会占满整个启动 wait；这只约束
+每次 socket attempt，Python 不能强制终止任意系统调用。
 
 入口在模块顶层只定义稳定的默认路径，不读取或解析 YAML：
 
@@ -306,16 +338,16 @@ uv run examples/spirit-ai/main.py
 
 ## 7. 迁移与代码边界
 
-会重写或移除当前实验性 RTC 表面：
+已重写或移除旧实验性 RTC 表面：
 
 - 删除 `compute_soft_mask`、`build_rtc_target_and_mask` 和旧 `RTCState` 的 replacement 语义；
 - 删除 Pi0 的 `rtc_target / rtc_weight` 采样分支及 Policy 对 `mask/beta` 的转发；
-- 删除 SpiritAI 的同步 `prefetch_next_chunk` RTC 逻辑；普通非 RTC 执行是否保留原 prefetch，
-  由其独立 runtime config 控制，不能与 RTC controller 交叉；
+- 删除 SpiritAI 的同步 `prefetch_next_chunk` RTC 逻辑；RTC 运行器只使用 YAML 配置的单飞
+  asynchronous scheduler，不能与旧 prefetch 语义交叉；
 - 新 RTC controller 只由 SpiritAI entrypoint 使用，避免悄悄改变 ALOHA、DROID、LIBERO。
 
-执行顺序应保持可 bisect：先落地模型与训练开关及单元测试，再接入 policy/websocket metadata，
-最后替换 SpiritAI runtime、YAML 和硬件 dry-run。具体任务分解将在本设计获批后单独写实施计划。
+实施保持可 bisect：模型与训练开关、policy/websocket metadata、SpiritAI runtime、YAML 和
+non-hardware verification 分别提交；完整任务分解见[实施计划](../plans/2026-08-07-training-time-rtc.md)。
 
 ## 8. 验证矩阵与验收
 
@@ -344,10 +376,13 @@ uv run examples/spirit-ai/main.py
 - **失效的旧文档/参数：** 与删除旧 API 同一变更更新 SpiritAI README，明确这是 training-time
   RTC，不宣称 VJP/soft mask 支持。
 
-## 10. Review 需要确认的事项
+## 10. 上线前操作检查
 
-1. 一期按 training-time RTC 唯一路径推进，VJP/soft mask 不实现；
-2. RTC 模式采用单步 command dispatcher，不依赖 robot server 支持队列/抢占；
-3. 默认 YAML 位于 `main.py` 的稳定相对路径，`--config` 可选择其他 profile；YAML 仅在 `main()` 中加载；
-4. 新 SpiritAI 执行参数全部进入 YAML，模型维度和训练 delay capability 从 server metadata 获取；
-5. `max_delay_steps` 的最终数值以部署前 latency profile 为准，而非现在猜测一个固定值。
+1. 使用 `rtc_training.enabled` 的 JAX Pi0.5 checkpoint，确认 policy metadata 为
+   `training_time_v1`；
+2. 在目标 `source_hz` 下先测量端到端 latency，再同时选择训练 max delay 和 YAML planned delay；
+3. 确认 robot 与 policy 都是 `ws://` endpoint，并先使用 `--dry-run` 验证配置、metadata 和
+   read-only preflight；
+4. 检查 YAML 中 policy connect、initial inference、command ACK 和 robot-idle timeout 是否适合
+   当前网络与机器人；
+5. 仅在上述条件满足且操作员授权后进行低速硬件 smoke test，记录第 8 节列出的全部指标。

@@ -96,9 +96,6 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        sample_kwargs.pop("rtc_target", None)
-        sample_kwargs.pop("rtc_weight", None)
-
         if rtc is not None:
             action_prefix, delay_steps = validate_training_time_request(
                 rtc, self.metadata.get("rtc_capabilities")
