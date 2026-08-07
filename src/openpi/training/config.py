@@ -558,6 +558,18 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RTCTrainingConfig:
+    enabled: bool = False
+    max_delay_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_delay_steps < 0:
+            raise ValueError("RTC training max_delay_steps must be non-negative.")
+        if not self.enabled and self.max_delay_steps != 0:
+            raise ValueError("RTC training max_delay_steps must be zero when disabled.")
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -570,6 +582,8 @@ class TrainConfig:
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
+
+    rtc_training: RTCTrainingConfig = dataclasses.field(default_factory=RTCTrainingConfig)
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
@@ -649,6 +663,11 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.rtc_training.enabled:
+            if not isinstance(self.model, pi0_config.Pi0Config) or not self.model.pi05:
+                raise ValueError("RTC training is only supported for JAX Pi0.5.")
+            if self.rtc_training.max_delay_steps > self.model.action_horizon // 2:
+                raise ValueError("RTC training max_delay_steps must be <= floor(action_horizon / 2).")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1191,6 +1210,43 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_spiritai_cart_lora_h50_multiscale_rtc",
+        exp_name="pi05_spiritai_cart_lora_h50_multiscale_rtc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSpiritaiCartesianDataConfig(
+            repo_id="spiritai/20260512_FoldPaperBox_Moz1WB_MixedTask5+7_Slice_Multiscale",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_500,
+            peak_lr=2e-5,
+            decay_steps=50_000,
+            decay_lr=2e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        log_interval=200,
+        wandb_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        rtc_training=RTCTrainingConfig(enabled=True, max_delay_steps=12),
     ),
     TrainConfig(
         name="pi05_spiritai_cart_lora_h50_subtask_enhance",
