@@ -201,6 +201,11 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         rtc_max_delay_steps: int | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
+        if rtc_max_delay_steps is not None and rtc_max_delay_steps >= self.action_horizon:
+            raise ValueError(
+                f"rtc_max_delay_steps ({rtc_max_delay_steps}) must be less than "
+                f"action_horizon ({self.action_horizon})"
+            )
         if rtc_max_delay_steps is None:
             preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
             observation = _model.preprocess_observation(preprocess_rng, observation, train=train)

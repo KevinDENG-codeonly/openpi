@@ -13,8 +13,20 @@ def test_prepare_training_inputs_preserves_clean_prefix():
         actions, noise, scalar_time, delay_steps
     )
 
-    assert jnp.array_equal(x_t[0, :2], actions[0, :2])
-    assert jnp.array_equal(token_time[0, :2], jnp.zeros(2, dtype=jnp.float32))
+    assert jnp.array_equal(
+        x_t,
+        jnp.array(
+            [
+                [[0.0], [1.0], [1.25], [2.0]],
+                [[0.25], [0.5], [0.75], [1.0]],
+            ],
+            dtype=jnp.float32,
+        ),
+    )
+    assert jnp.array_equal(
+        token_time,
+        jnp.array([[0.0, 0.0, 0.25, 0.25], [0.75, 0.75, 0.75, 0.75]], dtype=jnp.float32),
+    )
     assert jnp.array_equal(postfix_mask[0], jnp.array([False, False, True, True]))
     assert jnp.array_equal(postfix_mask[1], jnp.array([True, True, True, True]))
 
