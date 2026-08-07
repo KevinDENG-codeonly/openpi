@@ -168,6 +168,20 @@ def test_late_result_records_a_deadline_miss_and_keeps_the_old_plan():
     assert controller.consecutive_deadline_misses == 1
 
 
+def test_failed_request_records_a_deadline_miss_and_keeps_the_old_plan():
+    old_plan = make_plan(generation_tick=20)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=2, training_max_delay_steps=4)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=22, planned_delay_steps=2)
+
+    controller.record_failed_request(request)
+
+    assert controller.active_plan is old_plan
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 1
+    assert controller.consecutive_deadline_misses == 1
+
+
 def test_accept_result_rejects_completion_before_the_request_start_tick():
     old_plan = make_plan(generation_tick=10)
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)

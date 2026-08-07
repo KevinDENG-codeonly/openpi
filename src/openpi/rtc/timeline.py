@@ -221,6 +221,16 @@ class RTCController:
         self.consecutive_deadline_misses = 0
         return True
 
+    def record_failed_request(self, request: RTCRequest) -> None:
+        """Release a failed worker request without replacing the active plan."""
+        if self.inflight_request is None:
+            raise RTCStateError("no RTC request is in flight")
+        if request.request_id != self.inflight_request.request_id:
+            raise RTCStateError("stale or mismatched request cannot fail")
+        self.inflight_request = None
+        self.deadline_miss_count += 1
+        self.consecutive_deadline_misses += 1
+
     def action_for_tick(self, tick: int) -> DispatchAction:
         """Return the current plan's action at ``tick``, or an explicit hold."""
         tick = _nonnegative_integer(tick, "tick")
