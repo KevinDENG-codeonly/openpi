@@ -181,17 +181,25 @@ def _wait_until_robot_idle(
     busy_sleep_s: float,
     *,
     timeout_s: float,
+    idle_timeout_s: float,
 ) -> None:
+    deadline = time.monotonic() + idle_timeout_s
     while True:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise RuntimeError(f"robot did not become idle within {idle_timeout_s:g}s")
         robot_ws.send(spiritai_bridge.pack_robot_server_message({"type": "get_status"}))
         status = _recv_robot_response(
             robot_ws,
-            timeout_s=timeout_s,
+            timeout_s=min(timeout_s, remaining_s),
             operation="robot status response",
         )
         if not status["busy"]:
             return
-        time.sleep(busy_sleep_s)
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise RuntimeError(f"robot did not become idle within {idle_timeout_s:g}s")
+        time.sleep(min(busy_sleep_s, remaining_s))
 
 
 def _get_robot_obs(
@@ -792,6 +800,7 @@ def main(args: BootstrapArgs) -> None:
             robot_ws,
             runtime.control.busy_sleep_s,
             timeout_s=runtime.control.command_ack_timeout_s,
+            idle_timeout_s=runtime.control.robot_idle_timeout_s,
         )
         initial_obs, initial_images = _get_robot_obs(
             robot_ws,
@@ -838,6 +847,7 @@ def main(args: BootstrapArgs) -> None:
                     robot_ws,
                     runtime.control.busy_sleep_s,
                     timeout_s=runtime.control.command_ack_timeout_s,
+                    idle_timeout_s=runtime.control.robot_idle_timeout_s,
                 )
                 initial_obs, initial_images = _get_robot_obs(
                     robot_ws,
@@ -899,6 +909,7 @@ def main(args: BootstrapArgs) -> None:
                     robot_ws,
                     runtime.control.busy_sleep_s,
                     timeout_s=runtime.control.command_ack_timeout_s,
+                    idle_timeout_s=runtime.control.robot_idle_timeout_s,
                 )
                 obs, images = _get_robot_obs(
                     robot_ws,

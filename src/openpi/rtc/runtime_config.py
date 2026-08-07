@@ -83,6 +83,7 @@ class ControlRuntimeConfig:
     rollback_scale: float
     rpc_budget_fraction: float
     command_ack_timeout_s: float
+    robot_idle_timeout_s: float
     motion_limits: MotionLimitsRuntimeConfig
 
 
@@ -227,6 +228,7 @@ def _parse_control(value: Any) -> ControlRuntimeConfig:
             "rollback_scale",
             "rpc_budget_fraction",
             "command_ack_timeout_s",
+            "robot_idle_timeout_s",
             "motion_limits",
         },
         "control",
@@ -251,6 +253,9 @@ def _parse_control(value: Any) -> ControlRuntimeConfig:
         rpc_budget_fraction=rpc_budget_fraction,
         command_ack_timeout_s=_require_positive_real(
             mapping["command_ack_timeout_s"], "control.command_ack_timeout_s"
+        ),
+        robot_idle_timeout_s=_require_positive_real(
+            mapping["robot_idle_timeout_s"], "control.robot_idle_timeout_s"
         ),
         motion_limits=_parse_motion_limits(mapping["motion_limits"]),
     )

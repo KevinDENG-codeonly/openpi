@@ -18,6 +18,8 @@ control:
   rollback_scale: 0.2
   rpc_budget_fraction: 0.7
   command_ack_timeout_s: 1.0
+  # Total wall-clock budget for each startup, reset, and runtime idle preflight.
+  robot_idle_timeout_s: 10.0
   motion_limits:
     max_arm_velocity_rad_s: 0.35
     max_torso_velocity_rad_s: 0.2

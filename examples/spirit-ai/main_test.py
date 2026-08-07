@@ -322,7 +322,12 @@ def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
     ("invoke", "expected_message_type", "timeout_message"),
     [
         (
-            lambda main, socket: main._wait_until_robot_idle(socket, 0.0, timeout_s=0.25),  # noqa: SLF001
+            lambda main, socket: main._wait_until_robot_idle(  # noqa: SLF001
+                socket,
+                0.0,
+                timeout_s=0.25,
+                idle_timeout_s=1.0,
+            ),
             "get_status",
             "robot status response timed out after 0.25s",
         ),
@@ -363,6 +368,53 @@ def test_robot_preflight_recv_timeout_is_bounded_before_any_command_or_tick(
     assert robot_ws.received_timeouts == [0.25]
     assert [spiritai_bridge.unpack_robot_server_message(message)["type"] for message in robot_ws.sent] == [
         expected_message_type
+    ]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_idle_wait_has_a_total_deadline_without_sending_a_command(monkeypatch):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    clock = [0.0]
+    slept = []
+
+    class AlwaysBusyRobotSocket:
+        def __init__(self):
+            self.sent = []
+            self.received_timeouts = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self, *, timeout):
+            self.received_timeouts.append(timeout)
+            return spiritai_bridge.pack_robot_server_message({"busy": True})
+
+    def monotonic():
+        return clock[0]
+
+    def sleep(duration):
+        slept.append(duration)
+        clock[0] += duration
+
+    monkeypatch.setattr(main.time, "monotonic", monotonic)
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    robot_ws = AlwaysBusyRobotSocket()
+
+    with pytest.raises(RuntimeError, match="robot did not become idle within 1s"):
+        main._wait_until_robot_idle(  # noqa: SLF001
+            robot_ws,
+            busy_sleep_s=0.4,
+            timeout_s=0.25,
+            idle_timeout_s=1.0,
+        )
+
+    assert robot_ws.received_timeouts == pytest.approx([0.25, 0.25, 0.2])
+    assert slept == pytest.approx([0.4, 0.4, 0.2])
+    assert [spiritai_bridge.unpack_robot_server_message(message)["type"] for message in robot_ws.sent] == [
+        "get_status",
+        "get_status",
+        "get_status",
     ]
     assert controller.accepted_tick == 0
 
