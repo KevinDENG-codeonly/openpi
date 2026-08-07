@@ -61,6 +61,15 @@ def test_validate_training_time_request_converts_accepted_prefix_to_float32() ->
     assert delay_steps == 2
 
 
+@pytest.mark.parametrize("non_finite_value", [np.nan, np.inf, -np.inf])
+def test_validate_training_time_request_rejects_non_finite_prefix(non_finite_value: float) -> None:
+    request = _training_time_request()
+    request["action_prefix"][0, 0] = non_finite_value
+
+    with pytest.raises(RTCRequestError, match="finite"):
+        validate_training_time_request(request, make_capabilities(_train_config(enabled=True)))
+
+
 def test_validate_training_time_request_rejects_delay_over_capability() -> None:
     with pytest.raises(RTCRequestError, match="delay_steps"):
         validate_training_time_request(
@@ -93,6 +102,37 @@ def test_validate_training_time_request_rejects_unknown_or_non_exact_envelopes(r
         validate_training_time_request(rtc_request, make_capabilities(_train_config(enabled=True)))
 
 
+@pytest.mark.parametrize("algorithm", [np.array(["training_time_v1", "training_time_v1"]), 1])
+def test_validate_training_time_request_rejects_non_string_request_algorithm(algorithm) -> None:
+    request = _training_time_request()
+    request["algorithm"] = algorithm
+
+    with pytest.raises(RTCRequestError, match="algorithm must be a string"):
+        validate_training_time_request(request, make_capabilities(_train_config(enabled=True)))
+
+
+@pytest.mark.parametrize("algorithm", [np.array(["training_time_v1", "training_time_v1"]), 1])
+def test_validate_training_time_request_rejects_non_string_capability_algorithm(algorithm) -> None:
+    capability = make_capabilities(_train_config(enabled=True))
+    capability["algorithm"] = algorithm
+
+    with pytest.raises(RTCRequestError, match="algorithm must be a string"):
+        validate_training_time_request(_training_time_request(), capability)
+
+
+class _NonConvertibleDelay:
+    def __array__(self, dtype=None):
+        raise TypeError("cannot convert delay")
+
+
+@pytest.mark.parametrize("delay_steps", [[[0], [1, 2]], _NonConvertibleDelay()])
+def test_validate_training_time_request_converts_delay_errors_to_rtc_request_errors(delay_steps) -> None:
+    with pytest.raises(RTCRequestError, match="delay_steps"):
+        validate_training_time_request(
+            _training_time_request(delay_steps=delay_steps), make_capabilities(_train_config(enabled=True))
+        )
+
+
 def test_validate_training_time_request_rejects_wrong_prefix_shape() -> None:
     request = _training_time_request()
     request["action_prefix"] = np.ones((3, 3), dtype=np.float32)
@@ -122,6 +162,67 @@ def test_create_trained_policy_preserves_metadata_and_adds_capabilities(monkeypa
         "rtc_capabilities": make_capabilities(train_config),
     }
     assert train_config.policy_metadata == {"existing": "value"}
+
+
+def test_create_trained_jax_policy_preserves_explicit_rtc_capabilities(monkeypatch, tmp_path) -> None:
+    supplied_capability = {"algorithm": "caller_supplied"}
+    original_metadata = {"existing": "value", "rtc_capabilities": supplied_capability}
+    train_config = training_config.dataclasses.replace(
+        _train_config(enabled=True), policy_metadata=original_metadata
+    )
+    captured: dict = {}
+
+    class CapturingPolicy:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(model_module, "restore_params", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pi0_config.Pi0Config, "load", lambda *args, **kwargs: object())
+    monkeypatch.setattr(policy_module, "Policy", CapturingPolicy)
+
+    policy_config.create_trained_policy(train_config, tmp_path, norm_stats={})
+
+    assert captured["metadata"] == original_metadata
+    assert train_config.policy_metadata == original_metadata
+
+
+def test_create_trained_pytorch_policy_forces_disabled_rtc_capabilities(monkeypatch, tmp_path) -> None:
+    supplied_capability = {"algorithm": "training_time_v1", "untrusted": True}
+    original_metadata = {"existing": "value", "rtc_capabilities": supplied_capability}
+    train_config = training_config.dataclasses.replace(
+        _train_config(enabled=True), policy_metadata=original_metadata
+    )
+    captured: dict = {}
+
+    class CapturingPolicy:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+    class FakePaliGemma:
+        def to_bfloat16_for_selected_params(self, precision: str) -> None:
+            return None
+
+    class FakePytorchModel:
+        def __init__(self) -> None:
+            self.paligemma_with_expert = FakePaliGemma()
+
+    (tmp_path / "model.safetensors").touch()
+    monkeypatch.setattr(pi0_config.Pi0Config, "load_pytorch", lambda *args, **kwargs: FakePytorchModel())
+    monkeypatch.setattr(policy_module, "Policy", CapturingPolicy)
+
+    policy_config.create_trained_policy(train_config, tmp_path, norm_stats={}, pytorch_device="cpu")
+
+    assert captured["is_pytorch"] is True
+    assert captured["metadata"] == {
+        "existing": "value",
+        "rtc_capabilities": {
+            "algorithm": "disabled",
+            "model_type": "pi05",
+            "action_horizon": 4,
+            "action_dim": 3,
+        },
+    }
+    assert train_config.policy_metadata == original_metadata
 
 
 def test_policy_passes_only_training_time_rtc_kwargs(monkeypatch) -> None:

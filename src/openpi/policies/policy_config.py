@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 from openpi.rtc.capabilities import make_capabilities
+from openpi.rtc.capabilities import make_disabled_capabilities
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -74,7 +75,10 @@ def create_trained_policy(
             pytorch_device = "cpu"
 
     metadata = dict(train_config.policy_metadata or {})
-    metadata.setdefault("rtc_capabilities", make_capabilities(train_config))
+    if is_pytorch:
+        metadata["rtc_capabilities"] = make_disabled_capabilities(train_config)
+    else:
+        metadata.setdefault("rtc_capabilities", make_capabilities(train_config))
 
     return _policy.Policy(
         model,
