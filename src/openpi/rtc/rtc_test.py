@@ -166,10 +166,14 @@ class TestWebsocketEnvelope:
         assert obs is payload
         assert rtc is None
 
-    def test_new_format_with_rtc(self):
-        """New format: {"obs": {...}, "rtc": {...}}."""
+    def test_new_format_with_training_time_rtc(self):
+        """New format: {"obs": {...}, "rtc": training-time-v1 envelope}."""
         inner_obs = {"observation/image": np.zeros((3, 224, 224)), "prompt": "pick up cup"}
-        rtc_data = {"target": np.zeros((50, 32)), "mask": np.ones(50), "beta": 0.8}
+        rtc_data = {
+            "algorithm": "training_time_v1",
+            "action_prefix": np.zeros((50, 32), dtype=np.float32),
+            "delay_steps": 10,
+        }
         payload = {"obs": inner_obs, "rtc": rtc_data}
         if isinstance(payload, dict) and "obs" in payload:
             obs = payload["obs"]
@@ -179,6 +183,9 @@ class TestWebsocketEnvelope:
             rtc = None
         assert obs is inner_obs
         assert rtc is rtc_data
+        assert set(rtc) == {"algorithm", "action_prefix", "delay_steps"}
+        assert rtc["action_prefix"].shape == (50, 32)
+        assert isinstance(rtc["delay_steps"], int)
 
     def test_new_format_without_rtc(self):
         """New format with rtc=None should behave like no RTC."""
