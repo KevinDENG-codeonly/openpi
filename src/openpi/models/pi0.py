@@ -11,6 +11,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+from openpi.rtc import conditioning
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -138,12 +139,15 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, "b ..."],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b s emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -158,7 +162,10 @@ class Pi0(_model.BaseModel):
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        token_time = einops.repeat(timestep, "b -> b s", s=self.action_horizon) if timestep.ndim == 1 else timestep
+        time_emb = posemb_sincos(
+            token_time.reshape(-1), self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+        ).reshape(*token_time.shape, -1)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -169,8 +176,7 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
-            action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+            action_time_tokens = jnp.concatenate([action_tokens, time_emb], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
@@ -195,20 +201,32 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         rtc_max_delay_steps: int | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        del rtc_max_delay_steps  # Consumed by the RTC training loss implementation in a follow-up task.
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        if rtc_max_delay_steps is None:
+            preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+            observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+            batch_shape = actions.shape[:-2]
+            noise = jax.random.normal(noise_rng, actions.shape)
+            scalar_time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+            x_t = scalar_time[..., None, None] * noise + (1 - scalar_time[..., None, None]) * actions
+            token_time = scalar_time
+            postfix_mask = None
+        else:
+            preprocess_rng, noise_rng, time_rng, delay_rng = jax.random.split(rng, 4)
+            observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+            batch_shape = actions.shape[:-2]
+            noise = jax.random.normal(noise_rng, actions.shape)
+            scalar_time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+            delay_steps = jax.random.randint(delay_rng, batch_shape, 0, rtc_max_delay_steps + 1)
+            x_t, token_time, postfix_mask = conditioning.prepare_training_inputs(
+                actions, noise, scalar_time, delay_steps
+            )
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, token_time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -218,7 +236,11 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        per_token_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if postfix_mask is None:
+            return per_token_loss
+        postfix_count = jnp.sum(postfix_mask, axis=-1, keepdims=True)
+        return per_token_loss * postfix_mask.astype(per_token_loss.dtype) * (self.action_horizon / postfix_count)
 
     @override
     def sample_actions(

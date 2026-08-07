@@ -1,10 +1,12 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
+import openpi.models.gemma as _gemma
 from openpi.shared import download
 from openpi.shared import nnx_utils
 
@@ -22,6 +24,29 @@ def test_pi0_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi05_model_supports_tokenwise_rtc_conditioning():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=4,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(key)
+    obs, actions = config.fake_obs(), config.fake_act()
+    token_time = jnp.array([[0.0, 0.0, 0.5, 0.5]], dtype=jnp.float32)
+
+    _, _, _, adarms_cond = model.embed_suffix(obs, actions, token_time)
+
+    assert adarms_cond is not None
+    action_expert_width = _gemma.get_config(config.action_expert_variant).width
+    assert adarms_cond.shape == (1, config.action_horizon, action_expert_width)
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, actions, rtc_max_delay_steps=2)
+    assert loss.shape == (1, config.action_horizon)
+    assert jnp.all(jnp.isfinite(loss))
 
 
 def test_pi0_lora_model():
