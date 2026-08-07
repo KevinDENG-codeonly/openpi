@@ -13,7 +13,12 @@ from openpi.rtc.runtime_config import load_runtime_config
 
 VALID_RUNTIME = {
     "schema_version": 1,
-    "policy": {"host": "localhost", "port": 8000, "prompt": "fold"},
+    "policy": {
+        "host": "localhost",
+        "port": 8000,
+        "prompt": "fold",
+        "connect_timeout_s": 1.0,
+    },
     "robot": {
         "url": "ws://robot",
         "action_layout": "cartesian",
@@ -32,6 +37,7 @@ VALID_RUNTIME = {
         "rollback_guard_steps": 4,
         "rollback_scale": 0.2,
         "rpc_budget_fraction": 0.7,
+        "command_ack_timeout_s": 1.0,
         "motion_limits": {
             "max_arm_velocity_rad_s": 0.35,
             "max_torso_velocity_rad_s": 0.2,
@@ -127,6 +133,7 @@ def test_parser_loads_training_time_profile(tmp_path: Path) -> None:
 
     assert cfg.rtc.mode == "training_time"
     assert cfg.control.source_hz == 15.0
+    assert cfg.policy.connect_timeout_s == 1.0
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.policy.host = "other"
 
@@ -219,6 +226,39 @@ def test_parser_rejects_nonpositive_initial_inference_timeout(tmp_path: Path, ti
         load_runtime_config(path)
 
 
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0])
+def test_parser_rejects_nonpositive_policy_connect_timeout(tmp_path: Path, timeout_s: float) -> None:
+    runtime = copy.deepcopy(VALID_RUNTIME)
+    runtime["policy"]["connect_timeout_s"] = timeout_s
+    path = tmp_path / "bad.yaml"
+    write_runtime(path, runtime)
+
+    with pytest.raises(RuntimeConfigError, match="policy.connect_timeout_s must be positive"):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0])
+def test_parser_rejects_nonpositive_command_ack_timeout(tmp_path: Path, timeout_s: float) -> None:
+    runtime = copy.deepcopy(VALID_RUNTIME)
+    runtime["control"]["command_ack_timeout_s"] = timeout_s
+    path = tmp_path / "bad.yaml"
+    write_runtime(path, runtime)
+
+    with pytest.raises(RuntimeConfigError, match="control.command_ack_timeout_s must be positive"):
+        load_runtime_config(path)
+
+
+def test_parser_requires_each_policy_connect_attempt_to_finish_before_startup_timeout(tmp_path: Path) -> None:
+    runtime = copy.deepcopy(VALID_RUNTIME)
+    runtime["policy"]["connect_timeout_s"] = 10.0
+    runtime["rtc"]["initial_inference_timeout_s"] = 10.0
+    path = tmp_path / "bad.yaml"
+    write_runtime(path, runtime)
+
+    with pytest.raises(RuntimeConfigError, match="policy.connect_timeout_s must be less than rtc.initial_inference_timeout_s"):
+        load_runtime_config(path)
+
+
 @pytest.mark.parametrize("document", ["", "- not-a-mapping\n"])
 def test_parser_rejects_empty_or_nonmapping_document(tmp_path: Path, document: str) -> None:
     path = tmp_path / "bad.yaml"
@@ -233,11 +273,12 @@ def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None
 
     cfg = load_runtime_config(profile)
 
-    assert (cfg.schema_version, cfg.policy.host, cfg.policy.port, cfg.policy.prompt) == (
+    assert (cfg.schema_version, cfg.policy.host, cfg.policy.port, cfg.policy.prompt, cfg.policy.connect_timeout_s) == (
         1,
         "localhost",
         8000,
         "fold the paper box",
+        1.0,
     )
     assert (
         cfg.robot.url,
@@ -257,7 +298,8 @@ def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None
         cfg.control.rollback_guard_steps,
         cfg.control.rollback_scale,
         cfg.control.rpc_budget_fraction,
-    ) == (15.0, 2000, 0.01, 10.0, 4, 4, 0.2, 0.7)
+        cfg.control.command_ack_timeout_s,
+    ) == (15.0, 2000, 0.01, 10.0, 4, 4, 0.2, 0.7, 1.0)
     assert dataclasses.asdict(cfg.control.motion_limits) == VALID_RUNTIME["control"]["motion_limits"]
     assert (cfg.rtc.mode, cfg.rtc.s_min, cfg.rtc.initial_inference_timeout_s) == ("training_time", 5, 10.0)
     assert dataclasses.asdict(cfg.rtc.delay) == {"planned_max_steps": 12, "history_window": 16, "safety_margin_steps": 1}

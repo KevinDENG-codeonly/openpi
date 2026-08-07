@@ -1,5 +1,5 @@
 schema_version: 1
-policy: {host: localhost, port: 8000, prompt: fold the paper box}
+policy: {host: localhost, port: 8000, prompt: fold the paper box, connect_timeout_s: 1.0}
 robot:
   url: ws://172.16.0.30:8766
   action_layout: cartesian
@@ -17,6 +17,7 @@ control:
   rollback_guard_steps: 4
   rollback_scale: 0.2
   rpc_budget_fraction: 0.7
+  command_ack_timeout_s: 1.0
   motion_limits:
     max_arm_velocity_rad_s: 0.35
     max_torso_velocity_rad_s: 0.2

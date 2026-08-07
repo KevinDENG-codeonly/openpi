@@ -168,6 +168,19 @@ def _get_robot_obs(robot_ws: websockets.sync.client.ClientConnection) -> tuple[d
     return msg["obs"], msg["images"]
 
 
+def _wait_for_robot_command_ack(
+    robot_ws: websockets.sync.client.ClientConnection,
+    *,
+    timeout_s: float,
+    operation: str,
+) -> dict:
+    """Receive one command acknowledgement within the configured safety bound."""
+    try:
+        return spiritai_bridge.unpack_robot_server_message(robot_ws.recv(timeout=timeout_s))
+    except TimeoutError as exc:
+        raise RuntimeError(f"{operation} ACK timed out after {timeout_s:g}s") from exc
+
+
 def _set_robot_external_following(robot_ws: websockets.sync.client.ClientConnection, *, enabled: bool) -> None:
     robot_ws.send(spiritai_bridge.pack_robot_server_message({"type": "set_external_following", "enabled": enabled}))
     msg = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
@@ -221,6 +234,7 @@ def _send_initial_gripper_reset(
     gripper_reset_command_state: float,
     gripper_reset_steps: int,
     source_hz: float,
+    command_ack_timeout_s: float,
     dry_run: bool,
 ) -> bool:
     if policy_action_layout == "cartesian":
@@ -248,7 +262,11 @@ def _send_initial_gripper_reset(
             }
         )
     )
-    ack = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+    ack = _wait_for_robot_command_ack(
+        robot_ws,
+        timeout_s=command_ack_timeout_s,
+        operation="initial gripper reset",
+    )
     if not ack.get("accepted", False):
         raise spiritai_bridge.RobotServerProtocolError(f"Initial gripper reset rejected: {ack.get('error')}")
     logging.info(
@@ -376,6 +394,7 @@ class PolicyRTCWorker:
             host=self._runtime.policy.host,
             port=self._runtime.policy.port,
             cancel_event=self._cancel_event,
+            connect_timeout_s=self._runtime.policy.connect_timeout_s,
         )
 
     def _infer(self, task: PolicyWorkerTask) -> PolicyWorkerResult:
@@ -749,6 +768,7 @@ def main(args: BootstrapArgs) -> None:
                 gripper_reset_command_state=runtime.robot.gripper_reset_command_state,
                 gripper_reset_steps=runtime.robot.gripper_reset_steps,
                 source_hz=runtime.control.source_hz,
+                command_ack_timeout_s=runtime.control.command_ack_timeout_s,
                 dry_run=args.dry_run,
             )
             if reset_sent:
@@ -997,7 +1017,11 @@ def main(args: BootstrapArgs) -> None:
                         }
                     )
                 )
-                ack = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+                ack = _wait_for_robot_command_ack(
+                    robot_ws,
+                    timeout_s=runtime.control.command_ack_timeout_s,
+                    operation="terminal hold" if stop_after_dispatch is not None else "robot command",
+                )
                 ack_duration_s = time.perf_counter() - ack_started_at
                 if not ack.get("accepted", False):
                     logging.warning(

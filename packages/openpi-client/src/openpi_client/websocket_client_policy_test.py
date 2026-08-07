@@ -28,6 +28,29 @@ def test_close_is_idempotent_and_closes_the_active_connection(monkeypatch):
     assert connection.close_calls == 1
 
 
+def test_connect_attempt_passes_an_explicit_open_timeout(monkeypatch):
+    connect_calls = []
+
+    class FakeConnection:
+        def recv(self, *, timeout):
+            return b"metadata"
+
+        def close(self):
+            pass
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return FakeConnection()
+
+    monkeypatch.setattr(websocket_client_policy.websockets.sync.client, "connect", connect)
+    monkeypatch.setattr(websocket_client_policy.msgpack_numpy, "unpackb", lambda _value: {"name": "fake"})
+
+    policy = websocket_client_policy.WebsocketClientPolicy(connect_timeout_s=0.25)
+    policy.close()
+
+    assert connect_calls[0][1]["open_timeout"] == 0.25
+
+
 def test_server_wait_stops_immediately_when_cancelled_during_retry(monkeypatch):
     cancel_event = threading.Event()
     attempted_connection = threading.Event()

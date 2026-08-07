@@ -27,6 +27,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         port: Optional[int] = None,
         api_key: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
+        connect_timeout_s: Optional[float] = None,
     ) -> None:
         if host.startswith("ws"):
             self._uri = host
@@ -37,6 +38,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
         self._cancel_event = cancel_event or threading.Event()
+        if connect_timeout_s is not None and connect_timeout_s <= 0:
+            raise ValueError("connect_timeout_s must be positive when provided")
+        self._connect_timeout_s = connect_timeout_s
         self._state_lock = threading.RLock()
         self._closed = False
         self._ws: Optional[websockets.sync.client.ClientConnection] = None
@@ -52,11 +56,19 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             self._raise_if_cancelled()
             try:
-                # A synchronous connect call is not force-interruptible; once it returns,
-                # cancellation is checked and the raced connection is closed immediately.
+                # ``open_timeout`` bounds each socket attempt. Python cannot
+                # force-terminate arbitrary system calls; once connect returns,
+                # cancellation is checked and a raced connection is closed immediately.
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                connect_kwargs = {
+                    "compression": None,
+                    "max_size": None,
+                    "additional_headers": headers,
+                }
+                if self._connect_timeout_s is not None:
+                    connect_kwargs["open_timeout"] = self._connect_timeout_s
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri, **connect_kwargs
                 )
                 self._register_connection(conn)
                 metadata = self._recv_server_metadata(conn)

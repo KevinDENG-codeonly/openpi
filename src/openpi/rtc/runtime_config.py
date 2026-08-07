@@ -44,6 +44,7 @@ class PolicyRuntimeConfig:
     host: str
     port: int
     prompt: str
+    connect_timeout_s: float
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,6 +82,7 @@ class ControlRuntimeConfig:
     rollback_guard_steps: int
     rollback_scale: float
     rpc_budget_fraction: float
+    command_ack_timeout_s: float
     motion_limits: MotionLimitsRuntimeConfig
 
 
@@ -139,23 +141,38 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     if schema_version != 1:
         raise RuntimeConfigError(f"schema_version must be 1, got {schema_version}")
 
+    policy = _parse_policy(root["policy"])
+    control = _parse_control(root["control"])
+    rtc = _parse_rtc(root["rtc"])
+    if policy.connect_timeout_s >= rtc.initial_inference_timeout_s:
+        raise RuntimeConfigError(
+            "policy.connect_timeout_s must be less than rtc.initial_inference_timeout_s"
+        )
+
     return RuntimeConfig(
         schema_version=schema_version,
-        policy=_parse_policy(root["policy"]),
+        policy=policy,
         robot=_parse_robot(root["robot"]),
-        control=_parse_control(root["control"]),
-        rtc=_parse_rtc(root["rtc"]),
+        control=control,
+        rtc=rtc,
     )
 
 
 def _parse_policy(value: Any) -> PolicyRuntimeConfig:
     mapping = _require_mapping(value, "policy")
-    _require_exact_keys(mapping, {"host", "port", "prompt"}, "policy")
+    _require_exact_keys(mapping, {"host", "port", "prompt", "connect_timeout_s"}, "policy")
     host = _require_nonempty_string(mapping["host"], "policy.host")
     port = _require_positive_integer(mapping["port"], "policy.port")
     if port > 65535:
         raise RuntimeConfigError(f"policy.port must be at most 65535, got {port}")
-    return PolicyRuntimeConfig(host=host, port=port, prompt=_require_nonempty_string(mapping["prompt"], "policy.prompt"))
+    return PolicyRuntimeConfig(
+        host=host,
+        port=port,
+        prompt=_require_nonempty_string(mapping["prompt"], "policy.prompt"),
+        connect_timeout_s=_require_positive_real(
+            mapping["connect_timeout_s"], "policy.connect_timeout_s"
+        ),
+    )
 
 
 def _parse_robot(value: Any) -> RobotRuntimeConfig:
@@ -209,6 +226,7 @@ def _parse_control(value: Any) -> ControlRuntimeConfig:
             "rollback_guard_steps",
             "rollback_scale",
             "rpc_budget_fraction",
+            "command_ack_timeout_s",
             "motion_limits",
         },
         "control",
@@ -231,6 +249,9 @@ def _parse_control(value: Any) -> ControlRuntimeConfig:
         ),
         rollback_scale=rollback_scale,
         rpc_budget_fraction=rpc_budget_fraction,
+        command_ack_timeout_s=_require_positive_real(
+            mapping["command_ack_timeout_s"], "control.command_ack_timeout_s"
+        ),
         motion_limits=_parse_motion_limits(mapping["motion_limits"]),
     )
 

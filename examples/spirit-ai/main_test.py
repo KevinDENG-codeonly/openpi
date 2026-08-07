@@ -245,6 +245,58 @@ def test_policy_worker_close_cancels_and_closes_a_blocked_policy_call():
     assert len(close_thread_ids) == 1
 
 
+def test_policy_worker_passes_configured_connect_timeout_to_client_factory(monkeypatch):
+    main = load_main_module()
+    client_kwargs = []
+
+    class FakePolicyClient:
+        pass
+
+    def make_client(**kwargs):
+        client_kwargs.append(kwargs)
+        return FakePolicyClient()
+
+    monkeypatch.setattr(main._websocket_client_policy, "WebsocketClientPolicy", make_client)  # noqa: SLF001
+    policy_worker = main.PolicyRTCWorker(
+        runtime=SimpleNamespace(policy=SimpleNamespace(host="policy", port=8000, connect_timeout_s=0.25)),
+        prompt="fold the paper box",
+        policy_action_layout="joint",
+    )
+
+    policy_worker._default_policy_factory()  # noqa: SLF001
+    policy_worker.close()
+
+    assert client_kwargs == [
+        {
+            "host": "policy",
+            "port": 8000,
+            "connect_timeout_s": 0.25,
+            "cancel_event": policy_worker._cancel_event,  # noqa: SLF001
+        }
+    ]
+
+
+def test_terminal_hold_ack_timeout_uses_bound_without_advancing_tick():
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    received_timeouts = []
+
+    class TimeoutRobotSocket:
+        def recv(self, *, timeout):
+            received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    with pytest.raises(RuntimeError, match="terminal hold ACK timed out after 0.25s"):
+        main._wait_for_robot_command_ack(  # noqa: SLF001
+            TimeoutRobotSocket(),
+            timeout_s=0.25,
+            operation="terminal hold",
+        )
+
+    assert received_timeouts == [0.25]
+    assert controller.accepted_tick == 0
+
+
 def test_main_delegates_all_policy_ownership_to_policy_rtc_worker():
     main = load_main_module()
     main_source = inspect.getsource(main.main)
