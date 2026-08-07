@@ -123,12 +123,16 @@ class RTCController:
         """Return the plan currently used for dispatch."""
         return self.active_plan
 
-    def install_plan(self, plan: ActionPlan) -> None:
+    def install_initial_plan(self, plan: ActionPlan) -> None:
         """Install an initial action plan when no replacement is in flight."""
         if self.inflight_request is not None:
             raise RTCStateError("cannot install an action plan while a request is in flight")
         self._validate_plan_dimensions(plan)
         self.active_plan = plan
+
+    def install_plan(self, plan: ActionPlan) -> None:
+        """Backward-compatible alias for :meth:`install_initial_plan`."""
+        self.install_initial_plan(plan)
 
     def start_request(self, current_tick: int, planned_delay_steps: int) -> RTCRequest:
         """Freeze the training-time prefix and begin one replacement request."""
@@ -159,8 +163,8 @@ class RTCController:
         self.inflight_request = request
         return request
 
-    def accept_result(self, request: RTCRequest, result_plan: ActionPlan, completion_tick: int) -> None:
-        """Accept an on-time result for the current request or record a deadline miss."""
+    def accept_result(self, request: RTCRequest, result_plan: ActionPlan, completion_tick: int) -> bool:
+        """Return whether the current request completed on time and was installed."""
         completion_tick = _nonnegative_integer(completion_tick, "completion_tick")
         if self.inflight_request is None:
             raise RTCStateError("no RTC request is in flight")
@@ -172,7 +176,7 @@ class RTCController:
             self.inflight_request = None
             self.deadline_miss_count += 1
             self.consecutive_deadline_misses += 1
-            raise RTCStateError("RTC deadline miss: result exceeded its planned delay")
+            return False
         if result_plan.generation_tick != request.start_tick:
             raise RTCStateError("result_plan.generation_tick must equal request.start_tick")
 
@@ -180,6 +184,7 @@ class RTCController:
         self.active_plan = result_plan
         self.inflight_request = None
         self.consecutive_deadline_misses = 0
+        return True
 
     def action_for_tick(self, tick: int) -> DispatchAction:
         """Return the current plan's action at ``tick``, or an explicit hold."""
