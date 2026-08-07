@@ -1,4 +1,8 @@
 import logging
+import math
+import numbers
+import socket
+import struct
 import threading
 from typing import Dict, Optional, Tuple
 
@@ -13,6 +17,39 @@ _SERVER_METADATA_POLL_TIMEOUT_S = 0.1
 
 class PolicyCancelledError(RuntimeError):
     """Raised when a policy connection or inference is cancelled during shutdown."""
+
+
+def _native_timeval(timeout_s: float) -> bytes:
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, numbers.Real) or not math.isfinite(timeout_s):
+        raise ValueError("websocket write timeout must be a positive finite number")
+    if timeout_s <= 0:
+        raise ValueError("websocket write timeout must be positive")
+    seconds = int(timeout_s)
+    microseconds = round((timeout_s - seconds) * 1_000_000)
+    if microseconds == 1_000_000:
+        seconds += 1
+        microseconds = 0
+    if seconds == 0 and microseconds == 0:
+        microseconds = 1
+    return struct.pack("@ll", seconds, microseconds)
+
+
+def _configure_websocket_write_timeout(
+    connection: websockets.sync.client.ClientConnection, *, timeout_s: float
+) -> None:
+    """Set Linux ``SO_SNDTIMEO`` without changing the websocket receiver timeout.
+
+    The project targets Linux/POSIX. ``socket.settimeout()`` is intentionally not
+    used because it changes receive behavior in the websocket receiver thread.
+    """
+    raw_socket = getattr(connection, "socket", None)
+    setsockopt = getattr(raw_socket, "setsockopt", None)
+    if not callable(setsockopt):
+        raise RuntimeError("Websocket connection does not expose a usable socket for write timeout.")
+    try:
+        setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, _native_timeval(timeout_s))
+    except (OSError, TypeError, ValueError, struct.error) as exc:
+        raise RuntimeError("Failed to configure websocket write timeout.") from exc
 
 
 class WebsocketClientPolicy(_base_policy.BasePolicy):
@@ -70,6 +107,18 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 conn = websockets.sync.client.connect(
                     self._uri, **connect_kwargs
                 )
+                if self._connect_timeout_s is not None:
+                    try:
+                        _configure_websocket_write_timeout(
+                            conn,
+                            timeout_s=self._connect_timeout_s,
+                        )
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:  # noqa: BLE001
+                            logging.debug("Ignoring websocket close failure after write-timeout setup.", exc_info=True)
+                        raise
                 self._register_connection(conn)
                 metadata = self._recv_server_metadata(conn)
                 self._raise_if_cancelled()

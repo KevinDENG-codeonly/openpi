@@ -8,6 +8,8 @@ import dataclasses
 import importlib.util
 import inspect
 from pathlib import Path
+import socket
+import struct
 import sys
 import threading
 from types import SimpleNamespace
@@ -300,8 +302,20 @@ def test_terminal_hold_ack_timeout_uses_bound_without_advancing_tick():
 
 def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
     main = load_main_module()
-    connection = object()
     connect_calls = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.options = []
+
+        def setsockopt(self, level, option, value):
+            self.options.append((level, option, value))
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FakeSocket()
+
+    connection = FakeConnection()
 
     def connect(*args, **kwargs):
         connect_calls.append((args, kwargs))
@@ -316,6 +330,41 @@ def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
             {"max_size": None, "compression": None, "open_timeout": 0.25},
         )
     ]
+    assert connection.socket.options == [
+        (socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("@ll", 0, 250_000))
+    ]
+
+
+def test_robot_write_timeout_requires_a_usable_socket():
+    main = load_main_module()
+
+    with pytest.raises(RuntimeError, match="does not expose a usable socket"):
+        main._configure_websocket_write_timeout(object(), timeout_s=0.25)  # noqa: SLF001
+
+
+def test_robot_connection_write_timeout_failure_closes_the_transport(monkeypatch):
+    main = load_main_module()
+
+    class FailingSocket:
+        def setsockopt(self, level, option, value):
+            raise OSError("unsupported")
+
+    class FakeConnection:
+        socket = FailingSocket()
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    connection = FakeConnection()
+    monkeypatch.setattr(main.websockets.sync.client, "connect", lambda *args, **kwargs: connection)
+
+    with pytest.raises(RuntimeError, match="Failed to configure websocket write timeout"):
+        main._open_robot_connection("ws://robot", timeout_s=0.25)  # noqa: SLF001
+
+    assert connection.close_calls == 1
 
 
 @pytest.mark.parametrize(

@@ -9,8 +9,11 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 import contextlib
 import dataclasses
 import logging
+import math
 import numbers
 from pathlib import Path
+import socket
+import struct
 import threading
 import time
 from typing import Literal
@@ -154,13 +157,53 @@ def validate_rtc_runtime_metadata(runtime: RuntimeConfig, metadata: Mapping[str,
 def _open_robot_connection(
     robot_url: str, *, timeout_s: float
 ) -> websockets.sync.client.ClientConnection:
-    """Open the robot transport with the same bound used for robot responses."""
-    return websockets.sync.client.connect(
+    """Open and configure the robot transport before its first send."""
+    connection = websockets.sync.client.connect(
         robot_url,
         max_size=None,
         compression=None,
         open_timeout=timeout_s,
     )
+    try:
+        _configure_websocket_write_timeout(connection, timeout_s=timeout_s)
+    except Exception:
+        with contextlib.suppress(Exception):
+            connection.close()
+        raise
+    return connection
+
+
+def _native_timeval(timeout_s: float) -> bytes:
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, numbers.Real) or not math.isfinite(timeout_s):
+        raise ValueError("websocket write timeout must be a positive finite number")
+    if timeout_s <= 0:
+        raise ValueError("websocket write timeout must be positive")
+    seconds = int(timeout_s)
+    microseconds = round((timeout_s - seconds) * 1_000_000)
+    if microseconds == 1_000_000:
+        seconds += 1
+        microseconds = 0
+    if seconds == 0 and microseconds == 0:
+        microseconds = 1
+    return struct.pack("@ll", seconds, microseconds)
+
+
+def _configure_websocket_write_timeout(
+    connection: websockets.sync.client.ClientConnection, *, timeout_s: float
+) -> None:
+    """Set Linux ``SO_SNDTIMEO`` without changing the websocket receiver timeout.
+
+    The project targets Linux/POSIX. ``socket.settimeout()`` is intentionally not
+    used because it changes receive behavior in the websocket receiver thread.
+    """
+    raw_socket = getattr(connection, "socket", None)
+    setsockopt = getattr(raw_socket, "setsockopt", None)
+    if not callable(setsockopt):
+        raise RuntimeError("Websocket connection does not expose a usable socket for write timeout.")
+    try:
+        setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, _native_timeval(timeout_s))
+    except (OSError, TypeError, ValueError, struct.error) as exc:
+        raise RuntimeError("Failed to configure websocket write timeout.") from exc
 
 
 def _recv_robot_response(

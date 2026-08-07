@@ -1,6 +1,10 @@
 """Tests for cancellable websocket policy transport setup and shutdown."""
 
 import threading
+import socket
+import struct
+
+import pytest
 
 from openpi_client import websocket_client_policy
 
@@ -31,7 +35,17 @@ def test_close_is_idempotent_and_closes_the_active_connection(monkeypatch):
 def test_connect_attempt_passes_an_explicit_open_timeout(monkeypatch):
     connect_calls = []
 
+    class FakeSocket:
+        def __init__(self):
+            self.options = []
+
+        def setsockopt(self, level, option, value):
+            self.options.append((level, option, value))
+
     class FakeConnection:
+        def __init__(self):
+            self.socket = FakeSocket()
+
         def recv(self, *, timeout):
             return b"metadata"
 
@@ -46,9 +60,42 @@ def test_connect_attempt_passes_an_explicit_open_timeout(monkeypatch):
     monkeypatch.setattr(websocket_client_policy.msgpack_numpy, "unpackb", lambda _value: {"name": "fake"})
 
     policy = websocket_client_policy.WebsocketClientPolicy(connect_timeout_s=0.25)
+    connection = policy._ws  # noqa: SLF001
     policy.close()
 
     assert connect_calls[0][1]["open_timeout"] == 0.25
+    assert connection.socket.options == [
+        (socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("@ll", 0, 250_000))
+    ]
+
+
+def test_explicit_connect_timeout_fails_when_write_timeout_cannot_be_configured(monkeypatch):
+    class FailingSocket:
+        def setsockopt(self, level, option, value):
+            raise OSError("unsupported")
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FailingSocket()
+            self.close_calls = 0
+
+        def recv(self, *, timeout):
+            return b"metadata"
+
+        def close(self):
+            self.close_calls += 1
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        websocket_client_policy.websockets.sync.client,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to configure websocket write timeout"):
+        websocket_client_policy.WebsocketClientPolicy(connect_timeout_s=0.25)
+
+    assert connection.close_calls == 1
 
 
 def test_server_wait_stops_immediately_when_cancelled_during_retry(monkeypatch):
