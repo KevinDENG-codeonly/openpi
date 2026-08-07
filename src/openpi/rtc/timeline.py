@@ -78,7 +78,7 @@ class RTCRequest:
         object.__setattr__(
             self,
             "planned_delay_steps",
-            _nonnegative_integer(self.planned_delay_steps, "planned_delay_steps"),
+            _positive_integer(self.planned_delay_steps, "planned_delay_steps"),
         )
         object.__setattr__(
             self,

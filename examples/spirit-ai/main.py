@@ -11,6 +11,7 @@ import dataclasses
 import logging
 import numbers
 from pathlib import Path
+import threading
 import time
 from typing import Literal
 
@@ -356,6 +357,9 @@ class PolicyRTCWorker:
         self._policy_action_layout = policy_action_layout
         self._policy_factory = policy_factory or self._default_policy_factory
         self._policy: _websocket_client_policy.WebsocketClientPolicy | None = None
+        self._policy_lock = threading.Lock()
+        self._cancel_event = threading.Event()
+        self._transport_closed = False
         self._rtc_metadata: RTCRuntimeMetadata | None = None
         self._worker: RTCInferenceWorker[PolicyWorkerTask, PolicyWorkerResult] = RTCInferenceWorker(self._infer)
 
@@ -363,19 +367,27 @@ class PolicyRTCWorker:
         return self._worker.submit(task)
 
     def close(self, *, wait: bool = True) -> None:
+        self._cancel_event.set()
+        self._close_policy_transport()
         self._worker.close(wait=wait)
 
     def _default_policy_factory(self) -> _websocket_client_policy.WebsocketClientPolicy:
         return _websocket_client_policy.WebsocketClientPolicy(
             host=self._runtime.policy.host,
             port=self._runtime.policy.port,
+            cancel_event=self._cancel_event,
         )
 
     def _infer(self, task: PolicyWorkerTask) -> PolicyWorkerResult:
-        policy = self._policy
+        with self._policy_lock:
+            policy = self._policy
         if policy is None:
             policy = self._policy_factory()
-            self._policy = policy
+            with self._policy_lock:
+                self._policy = policy
+        if self._cancel_event.is_set():
+            self._close_policy_transport()
+            raise RuntimeError("Policy RTC worker was cancelled before policy inference started.")
 
         if isinstance(task, PolicyBootstrapTask):
             if self._rtc_metadata is None:
@@ -406,6 +418,19 @@ class PolicyRTCWorker:
             policy_action_layout=self._policy_action_layout,
             rtc_metadata=self._rtc_metadata,
         )
+
+    def _close_policy_transport(self) -> None:
+        with self._policy_lock:
+            policy = self._policy
+            if policy is None or self._transport_closed:
+                return
+            self._transport_closed = True
+        close = getattr(policy, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logging.exception("Ignoring policy transport close failure during RTC worker shutdown.")
 
 
 @contextlib.contextmanager

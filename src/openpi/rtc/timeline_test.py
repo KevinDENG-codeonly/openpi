@@ -65,6 +65,21 @@ def test_start_request_rejects_zero_delay_before_creating_a_request():
     assert controller.inflight_request is None
 
 
+def test_rtc_request_rejects_zero_delay_when_constructed_directly():
+    action_prefix = np.zeros((4, 2), dtype=np.float32)
+
+    with pytest.raises(RTCStateError, match="planned_delay_steps must be a positive integer"):
+        RTCRequest(
+            request_id=0,
+            source_generation_tick=0,
+            start_tick=1,
+            planned_delay_steps=0,
+            execution_horizon=1,
+            action_prefix=action_prefix,
+            frozen_prefix=action_prefix[:0],
+        )
+
+
 @pytest.mark.parametrize(
     ("planned_delay_steps", "current_tick"),
     [(2, 12)],

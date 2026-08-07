@@ -200,6 +200,51 @@ def test_policy_worker_owns_connection_metadata_and_all_inference_calls():
     assert len(set(factory_thread_ids + metadata_thread_ids + inference_thread_ids)) == 1
 
 
+def test_policy_worker_close_cancels_and_closes_a_blocked_policy_call():
+    main = load_main_module()
+    obs, images = make_joint_observation()
+    inference_started = threading.Event()
+    close_released_inference = threading.Event()
+    close_thread_ids = []
+
+    class BlockingPolicy:
+        def get_server_metadata(self):
+            return make_policy_metadata()
+
+        def infer(self, policy_obs, *, rtc, return_model_actions):
+            inference_started.set()
+            assert close_released_inference.wait(timeout=1)
+            return {
+                "actions": np.zeros((4, 27), dtype=np.float32),
+                "model_actions": np.zeros((4, 2), dtype=np.float32),
+            }
+
+        def close(self):
+            close_thread_ids.append(threading.get_ident())
+            close_released_inference.set()
+
+    policy_worker = main.PolicyRTCWorker(
+        runtime=make_runtime(),
+        prompt="fold the paper box",
+        policy_action_layout="joint",
+        policy_factory=BlockingPolicy,
+    )
+    try:
+        policy_worker.submit(main.PolicyBootstrapTask()).result(timeout=1)
+        future = policy_worker.submit(main.InitialInferenceTask(obs=obs, images=images))
+        assert inference_started.wait(timeout=1)
+
+        policy_worker.close(wait=False)
+
+        assert policy_worker._cancel_event.is_set()  # noqa: SLF001
+        assert close_thread_ids == [threading.get_ident()]
+        assert isinstance(future.result(timeout=1).value, ActionPlan)
+    finally:
+        policy_worker.close()
+
+    assert len(close_thread_ids) == 1
+
+
 def test_main_delegates_all_policy_ownership_to_policy_rtc_worker():
     main = load_main_module()
     main_source = inspect.getsource(main.main)
