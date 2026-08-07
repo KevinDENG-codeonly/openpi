@@ -4,6 +4,7 @@ import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
+from jax.experimental import io_callback
 import jax.numpy as jnp
 from typing_extensions import override
 
@@ -285,9 +286,24 @@ class Pi0(_model.BaseModel):
                     "rtc_delay_steps must have shape "
                     f"{expected_delay_shape}, got {rtc_delay_steps.shape}"
                 )
-            if not isinstance(rtc_delay_steps, jax.core.Tracer) and bool(
-                jnp.any((rtc_delay_steps < 0) | (rtc_delay_steps >= self.action_horizon))
-            ):
+            invalid_delay = jnp.any((rtc_delay_steps < 0) | (rtc_delay_steps >= self.action_horizon))
+            if isinstance(rtc_delay_steps, jax.core.Tracer):
+
+                def raise_invalid_delay(_):
+                    raise ValueError(
+                        "rtc_delay_steps must satisfy "
+                        f"0 <= delay < action_horizon ({self.action_horizon})"
+                    )
+
+                jax.lax.cond(
+                    invalid_delay,
+                    lambda delay: io_callback(
+                        raise_invalid_delay, jax.ShapeDtypeStruct((), jnp.int32), delay
+                    ),
+                    lambda _: jnp.zeros((), dtype=jnp.int32),
+                    rtc_delay_steps,
+                )
+            elif bool(invalid_delay):
                 raise ValueError(
                     "rtc_delay_steps must satisfy "
                     f"0 <= delay < action_horizon ({self.action_horizon})"

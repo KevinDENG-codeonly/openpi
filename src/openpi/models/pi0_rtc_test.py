@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 from openpi.models import pi0_config
+from openpi.shared import nnx_utils
 
 
 @pytest.fixture(scope="module")
@@ -107,3 +108,22 @@ def test_sample_actions_rejects_eager_out_of_range_rtc_delay(pi05_model, delay_s
             rtc_action_prefix=action_prefix,
             rtc_delay_steps=delay_steps,
         )
+
+
+def test_sample_actions_rejects_jitted_out_of_range_rtc_delay(pi05_model):
+    model, config = pi05_model
+    action_prefix, _ = _rtc_inputs(config)
+    sample_actions = nnx_utils.module_jit(model.sample_actions)
+
+    def sample_invalid_delay():
+        actions = sample_actions(
+            jax.random.key(7),
+            config.fake_obs(),
+            num_steps=1,
+            rtc_action_prefix=action_prefix,
+            rtc_delay_steps=jnp.array([config.action_horizon], dtype=jnp.int32),
+        )
+        return jax.block_until_ready(actions)
+
+    with pytest.raises(Exception, match="rtc_delay_steps must satisfy"):
+        sample_invalid_delay()
