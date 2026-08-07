@@ -55,10 +55,22 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                payload = msgpack_numpy.unpackb(await websocket.recv())
+
+                # Support new envelope format: {"obs": {...}, "rtc": {...}}
+                # while maintaining backward compatibility with old format (payload is obs directly).
+                infer_kwargs = {}
+                if isinstance(payload, dict) and "obs" in payload:
+                    obs = payload["obs"]
+                    if "rtc" in payload and payload["rtc"] is not None:
+                        infer_kwargs["rtc"] = payload["rtc"]
+                    if payload.get("return_model_actions", False):
+                        infer_kwargs["return_model_actions"] = True
+                else:
+                    obs = payload
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = self._policy.infer(obs, **infer_kwargs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

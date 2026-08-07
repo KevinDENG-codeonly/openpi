@@ -374,8 +374,14 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, **kwargs) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        # RTC is not yet supported in the PyTorch implementation.
+        if kwargs.get("rtc_target") is not None:
+            raise NotImplementedError(
+                "RTC (Real-Time Chunking) guidance is not supported in the PyTorch model. "
+                "Use the JAX model for RTC inference."
+            )
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)

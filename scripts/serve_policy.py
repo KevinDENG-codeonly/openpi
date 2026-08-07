@@ -18,6 +18,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    SPIRITAI = "spiritai"
 
 
 @dataclasses.dataclass
@@ -72,6 +73,10 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.LIBERO: Checkpoint(
         config="pi05_libero",
         dir="gs://openpi-assets/checkpoints/pi05_libero",
+    ),
+    EnvMode.SPIRITAI: Checkpoint(
+        config="pi05_spiritai_lora",
+        dir="checkpoints/pi05_spiritai_lora/20260512_FoldPaperBox_350ep_34000stp/33999",
     ),
 }
 
