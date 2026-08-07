@@ -9,7 +9,6 @@ import importlib.util
 import inspect
 from pathlib import Path
 import socket
-import struct
 import sys
 import threading
 from types import SimpleNamespace
@@ -304,16 +303,13 @@ def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
     main = load_main_module()
     connect_calls = []
 
-    class FakeSocket:
-        def __init__(self):
-            self.options = []
-
-        def setsockopt(self, level, option, value):
-            self.options.append((level, option, value))
+    class FakeRawSocket:
+        def send(self, data, flags):
+            raise AssertionError("the connection setup must not send data")
 
     class FakeConnection:
         def __init__(self):
-            self.socket = FakeSocket()
+            self.socket = FakeRawSocket()
 
     connection = FakeConnection()
 
@@ -330,27 +326,24 @@ def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
             {"max_size": None, "compression": None, "open_timeout": 0.25},
         )
     ]
-    assert connection.socket.options == [
-        (socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("@ll", 0, 250_000))
-    ]
+    assert isinstance(connection.socket, main._SocketWriteDeadlineProxy)  # noqa: SLF001
 
 
-def test_robot_write_timeout_requires_a_usable_socket():
+def test_robot_write_deadline_requires_a_usable_socket():
     main = load_main_module()
 
-    with pytest.raises(RuntimeError, match="does not expose a usable socket"):
-        main._configure_websocket_write_timeout(object(), timeout_s=0.25)  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="does not expose a usable socket for total write deadline"):
+        main._install_total_write_deadline(object(), timeout_s=0.25)  # noqa: SLF001
 
 
 def test_robot_connection_write_timeout_failure_closes_the_transport(monkeypatch):
     main = load_main_module()
 
-    class FailingSocket:
-        def setsockopt(self, level, option, value):
-            raise OSError("unsupported")
+    class UnusableSocket:
+        pass
 
     class FakeConnection:
-        socket = FailingSocket()
+        socket = UnusableSocket()
 
         def __init__(self):
             self.close_calls = 0
@@ -361,10 +354,89 @@ def test_robot_connection_write_timeout_failure_closes_the_transport(monkeypatch
     connection = FakeConnection()
     monkeypatch.setattr(main.websockets.sync.client, "connect", lambda *args, **kwargs: connection)
 
-    with pytest.raises(RuntimeError, match="Failed to configure websocket write timeout"):
+    with pytest.raises(RuntimeError, match="total write deadline"):
         main._open_robot_connection("ws://robot", timeout_s=0.25)  # noqa: SLF001
 
     assert connection.close_calls == 1
+
+
+def test_robot_write_deadline_proxy_does_not_reset_its_deadline_after_partial_writes(monkeypatch):
+    main = load_main_module()
+    clock = [0.0]
+    select_timeouts = []
+
+    class FakeRawSocket:
+        def __init__(self):
+            self.send_calls = []
+            self.shutdown_calls = []
+            self.close_calls = 0
+
+        def send(self, data, flags):
+            self.send_calls.append((bytes(data), flags))
+            clock[0] += 0.25
+            return 1
+
+        def recv(self, size):
+            return b"received"
+
+        def fileno(self):
+            return 42
+
+        def shutdown(self, how):
+            self.shutdown_calls.append(how)
+            return "shutdown"
+
+        def close(self):
+            self.close_calls += 1
+
+    raw_socket = FakeRawSocket()
+
+    def monotonic():
+        return clock[0]
+
+    def select(readable, writable, exceptional, timeout):
+        assert readable == []
+        assert writable == [raw_socket]
+        assert exceptional == []
+        select_timeouts.append(timeout)
+        if len(select_timeouts) < 3:
+            return [], [raw_socket], []
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(main.time, "monotonic", monotonic)
+    monkeypatch.setattr(main.select, "select", select)
+    proxy = main._SocketWriteDeadlineProxy(raw_socket, timeout_s=1.0)  # noqa: SLF001
+
+    with pytest.raises(TimeoutError, match="Websocket send timed out"):
+        proxy.sendall(b"abcd", flags=0x100)
+
+    assert select_timeouts == pytest.approx([1.0, 0.75, 0.5])
+    assert raw_socket.send_calls == [
+        (b"abcd", 0x100 | socket.MSG_DONTWAIT),
+        (b"bcd", 0x100 | socket.MSG_DONTWAIT),
+    ]
+    assert proxy.recv(1) == b"received"
+    assert proxy.fileno() == 42
+    assert proxy.shutdown(socket.SHUT_RDWR) == "shutdown"
+    proxy.close()
+    assert raw_socket.shutdown_calls == [socket.SHUT_RDWR]
+    assert raw_socket.close_calls == 1
+
+
+def test_robot_write_deadline_proxy_rejects_a_zero_byte_write(monkeypatch):
+    main = load_main_module()
+
+    class FakeRawSocket:
+        def send(self, data, flags):
+            return 0
+
+    raw_socket = FakeRawSocket()
+    monkeypatch.setattr(main.select, "select", lambda *_args: ([], [raw_socket], []))
+    proxy = main._SocketWriteDeadlineProxy(raw_socket, timeout_s=1.0)  # noqa: SLF001
+
+    with pytest.raises(OSError, match="zero-byte"):
+        proxy.sendall(b"x")
 
 
 @pytest.mark.parametrize(

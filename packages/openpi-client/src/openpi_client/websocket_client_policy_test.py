@@ -2,7 +2,6 @@
 
 import threading
 import socket
-import struct
 
 import pytest
 
@@ -35,16 +34,13 @@ def test_close_is_idempotent_and_closes_the_active_connection(monkeypatch):
 def test_connect_attempt_passes_an_explicit_open_timeout(monkeypatch):
     connect_calls = []
 
-    class FakeSocket:
-        def __init__(self):
-            self.options = []
-
-        def setsockopt(self, level, option, value):
-            self.options.append((level, option, value))
+    class FakeRawSocket:
+        def send(self, data, flags):
+            raise AssertionError("the connection setup must not send data")
 
     class FakeConnection:
         def __init__(self):
-            self.socket = FakeSocket()
+            self.socket = FakeRawSocket()
 
         def recv(self, *, timeout):
             return b"metadata"
@@ -64,19 +60,16 @@ def test_connect_attempt_passes_an_explicit_open_timeout(monkeypatch):
     policy.close()
 
     assert connect_calls[0][1]["open_timeout"] == 0.25
-    assert connection.socket.options == [
-        (socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("@ll", 0, 250_000))
-    ]
+    assert isinstance(connection.socket, websocket_client_policy._SocketWriteDeadlineProxy)  # noqa: SLF001
 
 
 def test_explicit_connect_timeout_fails_when_write_timeout_cannot_be_configured(monkeypatch):
-    class FailingSocket:
-        def setsockopt(self, level, option, value):
-            raise OSError("unsupported")
+    class UnusableSocket:
+        pass
 
     class FakeConnection:
         def __init__(self):
-            self.socket = FailingSocket()
+            self.socket = UnusableSocket()
             self.close_calls = 0
 
         def recv(self, *, timeout):
@@ -92,10 +85,73 @@ def test_explicit_connect_timeout_fails_when_write_timeout_cannot_be_configured(
         lambda *args, **kwargs: connection,
     )
 
-    with pytest.raises(RuntimeError, match="Failed to configure websocket write timeout"):
+    with pytest.raises(RuntimeError, match="total write deadline"):
         websocket_client_policy.WebsocketClientPolicy(connect_timeout_s=0.25)
 
     assert connection.close_calls == 1
+
+
+def test_policy_write_deadline_proxy_does_not_reset_its_deadline_after_partial_writes(monkeypatch):
+    clock = [0.0]
+    select_timeouts = []
+
+    class FakeRawSocket:
+        def __init__(self):
+            self.send_calls = []
+            self.shutdown_calls = []
+            self.close_calls = 0
+
+        def send(self, data, flags):
+            self.send_calls.append((bytes(data), flags))
+            clock[0] += 0.25
+            return 1
+
+        def recv(self, size):
+            return b"received"
+
+        def fileno(self):
+            return 42
+
+        def shutdown(self, how):
+            self.shutdown_calls.append(how)
+            return "shutdown"
+
+        def close(self):
+            self.close_calls += 1
+
+    raw_socket = FakeRawSocket()
+
+    def monotonic():
+        return clock[0]
+
+    def select(readable, writable, exceptional, timeout):
+        assert readable == []
+        assert writable == [raw_socket]
+        assert exceptional == []
+        select_timeouts.append(timeout)
+        if len(select_timeouts) < 3:
+            return [], [raw_socket], []
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(websocket_client_policy.time, "monotonic", monotonic)
+    monkeypatch.setattr(websocket_client_policy.select, "select", select)
+    proxy = websocket_client_policy._SocketWriteDeadlineProxy(raw_socket, timeout_s=1.0)  # noqa: SLF001
+
+    with pytest.raises(TimeoutError, match="Websocket send timed out"):
+        proxy.sendall(b"abcd", flags=0x100)
+
+    assert select_timeouts == pytest.approx([1.0, 0.75, 0.5])
+    assert raw_socket.send_calls == [
+        (b"abcd", 0x100 | socket.MSG_DONTWAIT),
+        (b"bcd", 0x100 | socket.MSG_DONTWAIT),
+    ]
+    assert proxy.recv(1) == b"received"
+    assert proxy.fileno() == 42
+    assert proxy.shutdown(socket.SHUT_RDWR) == "shutdown"
+    proxy.close()
+    assert raw_socket.shutdown_calls == [socket.SHUT_RDWR]
+    assert raw_socket.close_calls == 1
 
 
 def test_server_wait_stops_immediately_when_cancelled_during_retry(monkeypatch):

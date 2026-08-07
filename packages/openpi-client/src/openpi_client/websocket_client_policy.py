@@ -1,9 +1,11 @@
 import logging
 import math
 import numbers
+import errno
+import select
 import socket
-import struct
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
@@ -19,37 +21,59 @@ class PolicyCancelledError(RuntimeError):
     """Raised when a policy connection or inference is cancelled during shutdown."""
 
 
-def _native_timeval(timeout_s: float) -> bytes:
-    if isinstance(timeout_s, bool) or not isinstance(timeout_s, numbers.Real) or not math.isfinite(timeout_s):
-        raise ValueError("websocket write timeout must be a positive finite number")
-    if timeout_s <= 0:
-        raise ValueError("websocket write timeout must be positive")
-    seconds = int(timeout_s)
-    microseconds = round((timeout_s - seconds) * 1_000_000)
-    if microseconds == 1_000_000:
-        seconds += 1
-        microseconds = 0
-    if seconds == 0 and microseconds == 0:
-        microseconds = 1
-    return struct.pack("@ll", seconds, microseconds)
+class _SocketWriteDeadlineProxy:
+    """Delegate a socket while enforcing one Linux send deadline per ``sendall`` call.
+
+    ``MSG_DONTWAIT`` is a Linux per-send flag, unlike changing ``O_NONBLOCK`` or
+    calling ``socket.settimeout()`` on the shared descriptor. Consequently, the
+    websocket receiver thread continues to use the raw socket's normal receive
+    behavior while each write is bounded by one monotonic deadline.
+    """
+
+    def __init__(self, raw_socket: socket.socket, *, timeout_s: float) -> None:
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, numbers.Real) or not math.isfinite(timeout_s):
+            raise ValueError("websocket write deadline must be a positive finite number")
+        if timeout_s <= 0:
+            raise ValueError("websocket write deadline must be positive")
+        if not hasattr(socket, "MSG_DONTWAIT"):
+            raise RuntimeError("Websocket total write deadline requires Linux MSG_DONTWAIT.")
+        self._raw_socket = raw_socket
+        self._timeout_s = float(timeout_s)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._raw_socket, name)
+
+    def sendall(self, data: bytes, flags: int = 0) -> None:
+        payload = memoryview(data)
+        deadline = time.monotonic() + self._timeout_s
+        while payload:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError("Websocket send timed out before the full buffer was written.")
+            _readable, writable, _exceptional = select.select([], [self._raw_socket], [], remaining_s)
+            if not writable:
+                raise TimeoutError("Websocket send timed out before the full buffer was written.")
+            try:
+                sent = self._raw_socket.send(payload, flags | socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                raise
+            if sent <= 0:
+                raise OSError("Websocket socket made a zero-byte write.")
+            payload = payload[sent:]
 
 
-def _configure_websocket_write_timeout(
+def _install_total_write_deadline(
     connection: websockets.sync.client.ClientConnection, *, timeout_s: float
 ) -> None:
-    """Set Linux ``SO_SNDTIMEO`` without changing the websocket receiver timeout.
-
-    The project targets Linux/POSIX. ``socket.settimeout()`` is intentionally not
-    used because it changes receive behavior in the websocket receiver thread.
-    """
+    """Install a Linux total-deadline send proxy before the first application write."""
     raw_socket = getattr(connection, "socket", None)
-    setsockopt = getattr(raw_socket, "setsockopt", None)
-    if not callable(setsockopt):
-        raise RuntimeError("Websocket connection does not expose a usable socket for write timeout.")
-    try:
-        setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, _native_timeval(timeout_s))
-    except (OSError, TypeError, ValueError, struct.error) as exc:
-        raise RuntimeError("Failed to configure websocket write timeout.") from exc
+    if not callable(getattr(raw_socket, "send", None)):
+        raise RuntimeError("Websocket connection does not expose a usable socket for total write deadline.")
+    connection.socket = _SocketWriteDeadlineProxy(raw_socket, timeout_s=timeout_s)
 
 
 class WebsocketClientPolicy(_base_policy.BasePolicy):
@@ -109,7 +133,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 )
                 if self._connect_timeout_s is not None:
                     try:
-                        _configure_websocket_write_timeout(
+                        _install_total_write_deadline(
                             conn,
                             timeout_s=self._connect_timeout_s,
                         )
