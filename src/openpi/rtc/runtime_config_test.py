@@ -58,6 +58,10 @@ def write_runtime(path: Path, runtime: dict) -> None:
     path.write_text(yaml.safe_dump(runtime), encoding="utf-8")
 
 
+def valid_runtime_yaml() -> str:
+    return yaml.safe_dump(VALID_RUNTIME)
+
+
 def test_default_config_path_is_entrypoint_relative_without_reading(tmp_path: Path) -> None:
     entrypoint = tmp_path / "does-not-exist" / "main.py"
 
@@ -71,6 +75,46 @@ def test_parser_rejects_unknown_top_level_key(tmp_path: Path) -> None:
     write_runtime(path, runtime)
 
     with pytest.raises(RuntimeConfigError, match="unknown keys"):
+        load_runtime_config(path)
+
+
+def test_parser_rejects_duplicate_root_mapping_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(f"schema_version: 1\n{valid_runtime_yaml()}", encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError, match="duplicate mapping key 'schema_version'"):
+        load_runtime_config(path)
+
+
+def test_parser_rejects_duplicate_control_mapping_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    document = valid_runtime_yaml().replace(
+        "  source_hz: 15.0\n",
+        "  source_hz: 15.0\n  source_hz: 15.0\n",
+    )
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError, match="duplicate mapping key 'source_hz'"):
+        load_runtime_config(path)
+
+
+def test_parser_rejects_duplicate_motion_limit_mapping_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    document = valid_runtime_yaml().replace(
+        "    max_base_speed: 0.05\n",
+        "    max_base_speed: 0.05\n    max_base_speed: 0.05\n",
+    )
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError, match="duplicate mapping key 'max_base_speed'"):
+        load_runtime_config(path)
+
+
+def test_parser_normalizes_unhashable_mapping_key(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-key.yaml"
+    path.write_text("? [not, hashable]\n: value\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError, match="unhashable mapping key"):
         load_runtime_config(path)
 
 
@@ -123,6 +167,23 @@ def test_parser_rejects_boolean_for_integer_field(tmp_path: Path) -> None:
     write_runtime(path, runtime)
 
     with pytest.raises(RuntimeConfigError, match="policy.port must be an integer"):
+        load_runtime_config(path)
+
+
+def test_parser_normalizes_invalid_utf8_document(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-utf8.yaml"
+    path.write_bytes(b"\x80")
+
+    with pytest.raises(RuntimeConfigError, match="valid UTF-8"):
+        load_runtime_config(path)
+
+
+def test_parser_normalizes_overflowing_yaml_integer_to_runtime_config_error(tmp_path: Path) -> None:
+    path = tmp_path / "overflow.yaml"
+    document = valid_runtime_yaml().replace("  source_hz: 15.0", f"  source_hz: 1{'0' * 1000}")
+    path.write_text(document, encoding="utf-8")
+
+    with pytest.raises(RuntimeConfigError, match="control.source_hz must be finite"):
         load_runtime_config(path)
 
 

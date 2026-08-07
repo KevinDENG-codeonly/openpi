@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 import dataclasses
 import math
 import numbers
@@ -14,6 +14,29 @@ import yaml
 
 class RuntimeConfigError(ValueError):
     """Raised when a runtime configuration is invalid."""
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate or invalid mapping keys."""
+
+    def construct_mapping(
+        self, node: yaml.nodes.MappingNode, deep: bool = False  # noqa: FBT001, FBT002
+    ) -> dict[Any, Any]:
+        if not isinstance(node, yaml.nodes.MappingNode):
+            return super().construct_mapping(node, deep=deep)
+
+        mapping = {}
+        for key_node, value_node in node.value:
+            try:
+                key = self.construct_object(key_node, deep=deep)
+            except yaml.YAMLError as exc:
+                raise RuntimeConfigError("invalid mapping key") from exc
+            if not isinstance(key, Hashable):
+                raise RuntimeConfigError(f"unhashable mapping key {key!r}")
+            if key in mapping:
+                raise RuntimeConfigError(f"duplicate mapping key {key!r}")
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,7 +123,9 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     """Load a complete training-time RTC runtime profile from YAML."""
     config_path = Path(path)
     try:
-        document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        document = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_StrictSafeLoader)
+    except UnicodeDecodeError as exc:
+        raise RuntimeConfigError(f"Runtime config {config_path} must be valid UTF-8") from exc
     except OSError as exc:
         raise RuntimeConfigError(f"Unable to read runtime config {config_path}: {exc}") from exc
     except yaml.YAMLError as exc:
@@ -359,7 +384,10 @@ def _require_positive_integer(value: Any, location: str) -> int:
 def _require_finite_real(value: Any, location: str) -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise RuntimeConfigError(f"{location} must be a number")
-    real = float(value)
+    try:
+        real = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise RuntimeConfigError(f"{location} must be finite") from exc
     if not math.isfinite(real):
         raise RuntimeConfigError(f"{location} must be finite")
     return real
