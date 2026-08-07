@@ -196,8 +196,15 @@ Known Spirit AI configs live in [`src/openpi/training/config.py`](../../src/open
 | `pi05_spiritai_cart_lora_h30` | Cartesian 25D | 30 | Cartesian fold-box experiments |
 | `pi05_spiritai_cart_lora_h30_20260512_mixed` | Cartesian 25D | 30 | 20260512 mixed no-slice dataset |
 | `pi05_spiritai_cart_lora_h50_multiscale` | Cartesian 25D | 50 | 20260512 multiscale global/subtask dataset |
+| `pi05_spiritai_cart_lora_h50_multiscale_rtc` | Cartesian model 32D / robot 25D | 50 | Training-time RTC fine-tuning |
 
-All listed pi0.5 LoRA configs load the pi0.5 base checkpoint, train LoRA adapters on the VLM/action expert, freeze non-LoRA weights, and use `ema_decay=None`.
+All listed pi0.5 LoRA configs load the pi0.5 base checkpoint, train LoRA adapters on the VLM/action expert, freeze non-LoRA weights, and use `ema_decay=None`. The `_rtc` config additionally sets:
+
+```python
+rtc_training=RTCTrainingConfig(enabled=True, max_delay_steps=12)
+```
+
+This is the switch that enables training-time RTC. There is no separate `--enable-rtc` training flag. The positional config name selects the complete training recipe, including the RTC setting.
 
 ### 3.1 Checkpoint Readiness
 
@@ -289,6 +296,25 @@ uv run python scripts/train.py pi05_spiritai_lora \
     --ema-decay None
 ```
 
+Training-time RTC smoke test:
+
+```bash
+uv run python scripts/train.py pi05_spiritai_cart_lora_h50_multiscale_rtc \
+    --exp-name rtc_smoke_test \
+    --overwrite \
+    --num-train-steps 10 \
+    --batch-size 1 \
+    --save-interval 10 \
+    --log-interval 1 \
+    --no-wandb-enabled \
+    --ema-decay None
+```
+
+The first positional argument is the important RTC argument:
+`pi05_spiritai_cart_lora_h50_multiscale_rtc`. The remaining arguments are ordinary
+training controls for experiment naming, duration, batch size, checkpointing, and
+logging.
+
 Current multiscale h50 diagnostic:
 
 ```bash
@@ -321,6 +347,29 @@ uv run python scripts/train.py pi05_spiritai_cart_lora_h50_multiscale \
     --ema-decay None
 ```
 
+Training-time RTC full run:
+
+```bash
+uv run python scripts/train.py pi05_spiritai_cart_lora_h50_multiscale_rtc \
+    --exp-name 20260512_FoldPaperBox_multiscale_h50_rtc_50000stp \
+    --overwrite \
+    --num-train-steps 50000 \
+    --batch-size 16 \
+    --num-workers 4 \
+    --save-interval 5000 \
+    --keep-period 5000 \
+    --log-interval 200 \
+    --wandb-enabled \
+    --ema-decay None
+```
+
+`max_delay_steps=12` is compiled into this named training config. The deployment
+profile must use a compatible value, currently
+`rtc.delay.planned_max_steps: 12` in
+`examples/spirit-ai/configs/rtc/training_time.yaml`. If latency profiling leads to
+a different delay, update both the training config and the deployment YAML before
+starting a new fine-tuning run; do not change only the inference-side value.
+
 Resume the same experiment only when a finalized checkpoint exists:
 
 ```bash
@@ -351,6 +400,8 @@ tmux attach -t spiritai_train
 | `model.action_dim` | Padded pi0.5 action dimension; Spirit AI uses 32 |
 | `data.repo_id` | Must match the LeRobot symlink and norm stats path |
 | `data.extra_delta_transform` | Keep `False` for current absolute command datasets |
+| `rtc_training.enabled` | Must be `True` for the `_rtc` config; this trains the hard-prefix conditioning behavior |
+| `rtc_training.max_delay_steps` | Maximum trained inference delay; must be compatible with runtime `planned_max_steps` |
 | `batch_size` | Larger batches need more VRAM/host memory; validate with a short run |
 | `num_workers` | More workers can improve loading speed but increase host memory pressure |
 | `save_interval` | Lower values give more checkpoints but stress the host more often |
