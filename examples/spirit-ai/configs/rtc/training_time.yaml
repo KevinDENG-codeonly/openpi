@@ -31,5 +31,6 @@ control:
 rtc:
   mode: training_time
   s_min: 5
+  initial_inference_timeout_s: 10.0
   delay: {planned_max_steps: 12, history_window: 16, safety_margin_steps: 1}
   deadline_miss: {max_consecutive: 2, action: hold_then_stop}

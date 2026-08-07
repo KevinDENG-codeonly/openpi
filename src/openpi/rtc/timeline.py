@@ -162,7 +162,7 @@ class RTCController:
     def start_request(self, current_tick: int, planned_delay_steps: int) -> RTCRequest:
         """Freeze the training-time prefix and begin one replacement request."""
         current_tick = _nonnegative_integer(current_tick, "current_tick")
-        planned_delay_steps = _nonnegative_integer(planned_delay_steps, "planned_delay_steps")
+        planned_delay_steps = _positive_integer(planned_delay_steps, "planned_delay_steps")
         s = max(planned_delay_steps, self.s_min)
 
         if self.active_plan is None:

@@ -54,23 +54,20 @@ def test_start_request_uses_exact_shifted_prefix():
     np.testing.assert_array_equal(request.action_prefix[2:], 0.0)
 
 
-def test_start_request_preserves_an_empty_prefix_for_zero_delay():
+def test_start_request_rejects_zero_delay_before_creating_a_request():
     plan = make_plan()
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
     controller.install_initial_plan(plan)
 
-    request = controller.start_request(current_tick=11, planned_delay_steps=0)
+    with pytest.raises(RTCStateError, match="planned_delay_steps must be a positive integer"):
+        controller.start_request(current_tick=11, planned_delay_steps=0)
 
-    assert request.execution_horizon == 1
-    assert request.frozen_prefix.shape == (0, 2)
-    np.testing.assert_array_equal(request.frozen_prefix, plan.model_actions[1:1])
-    assert request.action_prefix.shape == (8, 2)
-    np.testing.assert_array_equal(request.action_prefix, 0.0)
+    assert controller.inflight_request is None
 
 
 @pytest.mark.parametrize(
     ("planned_delay_steps", "current_tick"),
-    [(2, 12), (0, 11)],
+    [(2, 12)],
 )
 def test_request_action_prefix_is_a_policy_valid_full_horizon_envelope(
     planned_delay_steps: int, current_tick: int
@@ -126,7 +123,7 @@ def test_start_request_rejects_delay_that_exhausts_the_remaining_horizon():
 
 @pytest.mark.parametrize(
     ("planned_delay_steps", "current_tick", "error_message"),
-    [(-1, 11, "nonnegative"), (5, 15, "training range")],
+    [(-1, 11, "positive"), (5, 15, "training range")],
 )
 def test_start_request_rejects_delay_outside_the_training_range(
     planned_delay_steps: int, current_tick: int, error_message: str
@@ -143,7 +140,7 @@ def test_start_request_requires_an_active_plan_and_only_one_inflight_request():
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
 
     with pytest.raises(RTCStateError, match="active action plan"):
-        controller.start_request(current_tick=0, planned_delay_steps=0)
+        controller.start_request(current_tick=0, planned_delay_steps=1)
 
     controller.install_initial_plan(make_plan())
     request = controller.start_request(current_tick=11, planned_delay_steps=1)

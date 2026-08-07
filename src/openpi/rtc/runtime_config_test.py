@@ -48,6 +48,7 @@ VALID_RUNTIME = {
     "rtc": {
         "mode": "training_time",
         "s_min": 5,
+        "initial_inference_timeout_s": 10.0,
         "delay": {"planned_max_steps": 12, "history_window": 16, "safety_margin_steps": 1},
         "deadline_miss": {"max_consecutive": 2, "action": "hold_then_stop"},
     },
@@ -207,6 +208,17 @@ def test_parser_rejects_zero_planned_delay_steps(tmp_path: Path) -> None:
         load_runtime_config(path)
 
 
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0])
+def test_parser_rejects_nonpositive_initial_inference_timeout(tmp_path: Path, timeout_s: float) -> None:
+    runtime = copy.deepcopy(VALID_RUNTIME)
+    runtime["rtc"]["initial_inference_timeout_s"] = timeout_s
+    path = tmp_path / "bad.yaml"
+    write_runtime(path, runtime)
+
+    with pytest.raises(RuntimeConfigError, match="rtc.initial_inference_timeout_s must be positive"):
+        load_runtime_config(path)
+
+
 @pytest.mark.parametrize("document", ["", "- not-a-mapping\n"])
 def test_parser_rejects_empty_or_nonmapping_document(tmp_path: Path, document: str) -> None:
     path = tmp_path / "bad.yaml"
@@ -247,6 +259,6 @@ def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None
         cfg.control.rpc_budget_fraction,
     ) == (15.0, 2000, 0.01, 10.0, 4, 4, 0.2, 0.7)
     assert dataclasses.asdict(cfg.control.motion_limits) == VALID_RUNTIME["control"]["motion_limits"]
-    assert (cfg.rtc.mode, cfg.rtc.s_min) == ("training_time", 5)
+    assert (cfg.rtc.mode, cfg.rtc.s_min, cfg.rtc.initial_inference_timeout_s) == ("training_time", 5, 10.0)
     assert dataclasses.asdict(cfg.rtc.delay) == {"planned_max_steps": 12, "history_window": 16, "safety_margin_steps": 1}
     assert dataclasses.asdict(cfg.rtc.deadline_miss) == {"max_consecutive": 2, "action": "hold_then_stop"}

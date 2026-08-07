@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import contextlib
 import dataclasses
 import logging
@@ -20,6 +21,7 @@ import websockets.sync.client
 
 from openpi.policies import spiritai_bridge
 from openpi.rtc import ActionPlan
+from openpi.rtc import DispatchAction
 from openpi.rtc import RTCController
 from openpi.rtc import RTCRequest
 from openpi.rtc.runtime_config import RuntimeConfig
@@ -420,6 +422,36 @@ def _robot_session_with_policy_cleanup(
         yield robot_ws
 
 
+def _policy_worker_cleanup_can_wait(
+    *,
+    bootstrap_future: Future[object] | None,
+    initial_inference_future: Future[object] | None,
+    flight: RTCInferenceFlight | None,
+) -> bool:
+    """Return whether every policy operation is complete before shutdown waits."""
+    return all(
+        future is None or future.done()
+        for future in (
+            bootstrap_future,
+            initial_inference_future,
+            None if flight is None else flight.future,
+        )
+    )
+
+
+def _wait_for_policy_worker_result(
+    future: Future[RTCInferenceResult[PolicyWorkerResult]],
+    *,
+    timeout_s: float,
+    operation: str,
+) -> RTCInferenceResult[PolicyWorkerResult]:
+    """Bound a synchronous policy-worker operation and report a clear stage name."""
+    try:
+        return future.result(timeout=timeout_s)
+    except FutureTimeoutError as exc:
+        raise RuntimeError(f"{operation} timed out after {timeout_s:g}s") from exc
+
+
 def _current_command_state(
     obs: Mapping[str, object],
     *,
@@ -506,12 +538,34 @@ def _apply_one_row_safety_filters(
     )
 
 
-def _raise_after_consecutive_deadline_misses(*, count: int, max_consecutive: int, reason: str) -> None:
+def _hold_then_stop_reason(
+    *,
+    worker_misses: int,
+    rpc_budget_misses: int,
+    max_consecutive: int,
+    action: str,
+) -> str | None:
+    """Return the reason that requires one hold command before stopping."""
+    if action != "hold_then_stop":
+        return None
     stop_after = max(1, max_consecutive)
-    if count >= stop_after:
-        raise RuntimeError(
-            f"Stopping after {count} consecutive RTC deadline misses ({reason}); configured maximum is {max_consecutive}."
-        )
+    if worker_misses >= stop_after:
+        return "worker inference failed or missed its deadline"
+    if rpc_budget_misses >= stop_after:
+        return "RPC budget exceeded"
+    return None
+
+
+def _dispatch_for_stop_or_plan(
+    controller: RTCController,
+    *,
+    current_tick: int,
+    stop_reason: str | None,
+) -> tuple[DispatchAction, str | None]:
+    """Choose a one-tick hold at the threshold instead of dispatching a stale plan action."""
+    if stop_reason is not None:
+        return DispatchAction(kind="hold"), stop_reason
+    return controller.action_for_tick(current_tick), None
 
 
 def main(args: BootstrapArgs) -> None:
@@ -532,13 +586,36 @@ def main(args: BootstrapArgs) -> None:
         prompt=runtime.policy.prompt,
         policy_action_layout=policy_action_layout,
     )
+    bootstrap_future: Future[RTCInferenceResult[PolicyWorkerResult]] | None = None
+    initial_inference_future: Future[RTCInferenceResult[PolicyWorkerResult]] | None = None
+    flight: RTCInferenceFlight | None = None
     try:
-        bootstrap_result = policy_worker.submit(PolicyBootstrapTask()).result().value
+        bootstrap_future = policy_worker.submit(PolicyBootstrapTask())
+        bootstrap_result = _wait_for_policy_worker_result(
+            bootstrap_future,
+            timeout_s=runtime.rtc.initial_inference_timeout_s,
+            operation="policy bootstrap metadata",
+        ).value
     except Exception:
-        policy_worker.close()
+        policy_worker.close(
+            wait=_policy_worker_cleanup_can_wait(
+                bootstrap_future=bootstrap_future,
+                initial_inference_future=initial_inference_future,
+                flight=flight,
+            )
+        )
         raise
+    finally:
+        if bootstrap_future is not None and bootstrap_future.done():
+            bootstrap_future = None
     if not isinstance(bootstrap_result, RTCRuntimeMetadata):
-        policy_worker.close()
+        policy_worker.close(
+            wait=_policy_worker_cleanup_can_wait(
+                bootstrap_future=bootstrap_future,
+                initial_inference_future=initial_inference_future,
+                flight=flight,
+            )
+        )
         raise RuntimeError("Policy RTC worker returned an invalid bootstrap result.")
     rtc_metadata = bootstrap_result
     logging.info(
@@ -548,11 +625,14 @@ def main(args: BootstrapArgs) -> None:
         rtc_metadata.training_max_delay_steps,
     )
 
-    flight: RTCInferenceFlight | None = None
     with _robot_session_with_policy_cleanup(
         websockets.sync.client.connect(runtime.robot.url, max_size=None, compression=None),
         policy_worker,
-        wait_for_policy=lambda: flight is None or flight.future.done(),
+        wait_for_policy=lambda: _policy_worker_cleanup_can_wait(
+            bootstrap_future=bootstrap_future,
+            initial_inference_future=initial_inference_future,
+            flight=flight,
+        ),
     ) as robot_ws:
         hello = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
         if hello.get("type") != "hello":
@@ -668,7 +748,16 @@ def main(args: BootstrapArgs) -> None:
                     )
 
         initial_inference_started_at = time.perf_counter()
-        initial_result = policy_worker.submit(InitialInferenceTask(obs=initial_obs, images=initial_images)).result()
+        initial_inference_future = policy_worker.submit(InitialInferenceTask(obs=initial_obs, images=initial_images))
+        try:
+            initial_result = _wait_for_policy_worker_result(
+                initial_inference_future,
+                timeout_s=runtime.rtc.initial_inference_timeout_s,
+                operation="initial policy inference",
+            )
+        finally:
+            if initial_inference_future.done():
+                initial_inference_future = None
         logging.info(
             "Initial worker policy inference latency: %.3fs", time.perf_counter() - initial_inference_started_at
         )
@@ -786,16 +875,14 @@ def main(args: BootstrapArgs) -> None:
                             flight.request.request_id,
                         )
 
-                _raise_after_consecutive_deadline_misses(
-                    count=consecutive_rpc_budget_misses,
+                stop_reason = _hold_then_stop_reason(
+                    worker_misses=controller.consecutive_deadline_misses,
+                    rpc_budget_misses=consecutive_rpc_budget_misses,
                     max_consecutive=runtime.rtc.deadline_miss.max_consecutive,
-                    reason="RPC budget exceeded",
+                    action=runtime.rtc.deadline_miss.action,
                 )
-                _raise_after_consecutive_deadline_misses(
-                    count=controller.consecutive_deadline_misses,
-                    max_consecutive=runtime.rtc.deadline_miss.max_consecutive,
-                    reason="worker inference failed or missed its deadline",
-                )
+                if stop_reason is not None:
+                    logging.error("Tick %d threshold reached (%s); sending one hold before stopping", current_tick, stop_reason)
 
                 active_plan = controller.current_plan
                 request_due = (
@@ -805,7 +892,13 @@ def main(args: BootstrapArgs) -> None:
                     and current_tick + runtime.rtc.delay.planned_max_steps
                     <= active_plan.generation_tick + rtc_metadata.action_horizon
                 )
-                if not rpc_budget_exceeded and flight is None and controller.inflight_request is None and request_due:
+                if (
+                    stop_reason is None
+                    and not rpc_budget_exceeded
+                    and flight is None
+                    and controller.inflight_request is None
+                    and request_due
+                ):
                     request = controller.start_request(
                         current_tick=current_tick,
                         planned_delay_steps=runtime.rtc.delay.planned_max_steps,
@@ -821,7 +914,11 @@ def main(args: BootstrapArgs) -> None:
                         request.planned_delay_steps,
                     )
 
-                dispatch = controller.action_for_tick(current_tick)
+                dispatch, stop_after_dispatch = _dispatch_for_stop_or_plan(
+                    controller,
+                    current_tick=current_tick,
+                    stop_reason=stop_reason,
+                )
                 command = _one_row_command_for_dispatch(
                     dispatch_kind=dispatch.kind,
                     robot_action=dispatch.robot_action,
@@ -858,6 +955,10 @@ def main(args: BootstrapArgs) -> None:
 
                 if args.dry_run:
                     logging.info("Tick %d dry run: suppressing one %s command", current_tick, dispatch.kind)
+                    if stop_after_dispatch is not None:
+                        raise RuntimeError(
+                            f"Stopping after {stop_after_dispatch}; dry run suppressed the one-row hold command."
+                        )
                     continue
 
                 ack_started_at = time.perf_counter()
@@ -880,6 +981,10 @@ def main(args: BootstrapArgs) -> None:
                         ack_duration_s,
                         ack.get("error"),
                     )
+                    if stop_after_dispatch is not None:
+                        raise RuntimeError(
+                            f"Stopping after {stop_after_dispatch}; robot rejected the one-row hold command."
+                        )
                     continue
 
                 controller.record_accepted_tick(acknowledged=True)
@@ -894,6 +999,10 @@ def main(args: BootstrapArgs) -> None:
                     ack.get("expected_finish_at"),
                     ack_duration_s,
                 )
+                if stop_after_dispatch is not None:
+                    raise RuntimeError(
+                        f"Stopping after {stop_after_dispatch}; acknowledged one-row hold command was sent."
+                    )
         finally:
             logging.info("RTC control loop exiting; robot transport closes before policy worker cleanup.")
 

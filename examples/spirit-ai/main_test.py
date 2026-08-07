@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import dataclasses
 import importlib.util
 import inspect
@@ -301,6 +302,108 @@ def test_robot_session_closes_robot_before_abandoning_a_hung_policy_worker():
         ("robot_exit", None),
         ("policy_close", False),
     ]
+
+
+def test_synchronous_policy_wait_uses_the_configured_timeout():
+    main = load_main_module()
+    timeouts = []
+
+    class TimedOutFuture:
+        def result(self, *, timeout):
+            timeouts.append(timeout)
+            raise FutureTimeoutError()
+
+    with pytest.raises(RuntimeError, match="initial policy inference timed out after 0.25s"):
+        main._wait_for_policy_worker_result(  # noqa: SLF001
+            TimedOutFuture(),
+            timeout_s=0.25,
+            operation="initial policy inference",
+        )
+
+    assert timeouts == [0.25]
+
+
+def test_robot_session_closes_robot_before_abandoning_timed_out_initial_inference():
+    main = load_main_module()
+    events = []
+    initial_future = Future()
+
+    class FakePolicyWorker:
+        def close(self, *, wait=True):
+            events.append(("policy_close", wait))
+
+    class FakeRobotConnection:
+        def __enter__(self):
+            events.append(("robot_enter", None))
+            return object()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("robot_exit", None))
+
+    with main._robot_session_with_policy_cleanup(  # noqa: SLF001
+        FakeRobotConnection(),
+        FakePolicyWorker(),
+        wait_for_policy=lambda: main._policy_worker_cleanup_can_wait(  # noqa: SLF001
+            bootstrap_future=None,
+            initial_inference_future=initial_future,
+            flight=None,
+        ),
+    ):
+        events.append(("initial_timeout", None))
+
+    assert events == [
+        ("robot_enter", None),
+        ("initial_timeout", None),
+        ("robot_exit", None),
+        ("policy_close", False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("worker_misses", "rpc_budget_misses", "expected_reason"),
+    [
+        (2, 0, "worker inference failed or missed its deadline"),
+        (0, 2, "RPC budget exceeded"),
+    ],
+)
+def test_stop_threshold_replaces_a_stale_plan_action_with_a_one_row_hold(
+    worker_misses: int,
+    rpc_budget_misses: int,
+    expected_reason: str,
+):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(
+        ActionPlan(
+            generation_tick=0,
+            model_actions=np.ones((4, 2), dtype=np.float32),
+            robot_actions=np.full((4, 3), 9.0, dtype=np.float32),
+        )
+    )
+    reason = main._hold_then_stop_reason(  # noqa: SLF001
+        worker_misses=worker_misses,
+        rpc_budget_misses=rpc_budget_misses,
+        max_consecutive=2,
+        action="hold_then_stop",
+    )
+
+    dispatch, stop_after_dispatch = main._dispatch_for_stop_or_plan(  # noqa: SLF001
+        controller,
+        current_tick=0,
+        stop_reason=reason,
+    )
+    command = main._one_row_command_for_dispatch(  # noqa: SLF001
+        dispatch_kind=dispatch.kind,
+        robot_action=dispatch.robot_action,
+        current_state=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        policy_action_layout="joint",
+        command_dim=3,
+    )
+
+    assert reason == expected_reason
+    assert stop_after_dispatch == expected_reason
+    assert dispatch.kind == "hold"
+    np.testing.assert_array_equal(command, [[1.0, 2.0, 3.0]])
 
 
 def test_bootstrap_args_is_a_frozen_dataclass():

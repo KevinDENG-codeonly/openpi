@@ -101,6 +101,7 @@ class RTCDeadlineRuntimeConfig:
 class RTCRuntimeConfig:
     mode: str
     s_min: int
+    initial_inference_timeout_s: float
     delay: RTCDelayRuntimeConfig
     deadline_miss: RTCDeadlineRuntimeConfig
 
@@ -284,13 +285,16 @@ def _parse_motion_limits(value: Any) -> MotionLimitsRuntimeConfig:
 
 def _parse_rtc(value: Any) -> RTCRuntimeConfig:
     mapping = _require_mapping(value, "rtc")
-    _require_exact_keys(mapping, {"mode", "s_min", "delay", "deadline_miss"}, "rtc")
+    _require_exact_keys(mapping, {"mode", "s_min", "initial_inference_timeout_s", "delay", "deadline_miss"}, "rtc")
     mode = _require_nonempty_string(mapping["mode"], "rtc.mode")
     if mode != "training_time":
         raise RuntimeConfigError("rtc.mode must be 'training_time'")
     return RTCRuntimeConfig(
         mode=mode,
         s_min=_require_nonnegative_integer(mapping["s_min"], "rtc.s_min"),
+        initial_inference_timeout_s=_require_positive_real(
+            mapping["initial_inference_timeout_s"], "rtc.initial_inference_timeout_s"
+        ),
         delay=_parse_delay(mapping["delay"]),
         deadline_miss=_parse_deadline_miss(mapping["deadline_miss"]),
     )
