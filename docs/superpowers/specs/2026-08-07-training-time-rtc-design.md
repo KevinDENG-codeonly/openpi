@@ -245,7 +245,7 @@ RTT 已耗尽单步预算，或连续实际 command RTT 使预算不可达，RTC
 ## 6. YAML 与命令行
 
 训练仍沿用仓库的 Python `TrainConfig` 注册机制；执行器改用单一 YAML profile。新增
-`examples/spirit-ai/configs/rtc/training_time.yaml` 作为模板，结构如下：
+`examples/spirit-ai/configs/rtc/training_time.yaml` 作为默认模板，结构如下：
 
 ```yaml
 schema_version: 1
@@ -277,13 +277,30 @@ rtc:
 训练 `max_delay_steps` 和部署上限设为同一范围。严格 YAML loader 必须拒绝未知键、错误类型、
 不支持的 `mode` 及 metadata 不匹配。
 
+入口在模块顶层只定义稳定的默认路径，不读取或解析 YAML：
+
+```python
+DEFAULT_RUNTIME_CONFIG = Path(__file__).parent / "configs/rtc/training_time.yaml"
+
+@dataclasses.dataclass(frozen=True)
+class BootstrapArgs:
+    config: Path = DEFAULT_RUNTIME_CONFIG
+    dry_run: bool = False
+```
+
+`main()` 在 CLI bootstrap 解析完成后才加载 `BootstrapArgs.config`、校验它并构造完整
+`RuntimeConfig`。这避免测试、导入工具或文档生成时意外读取本地文件，也使相对路径不依赖
+当前工作目录。启动时必须记录解析后的 config 路径、robot URL、RTC mode 和 `source_hz`。
+
 SpiritAI 的启动入口收敛为：
 
 ```bash
-uv run examples/spirit-ai/main.py --config examples/spirit-ai/configs/rtc/training_time.yaml
+uv run examples/spirit-ai/main.py
 ```
 
-只保留 `--config` 与少量运维覆盖（如日志级别、dry-run）。旧的 `--enable-rtc`、
+需要替换部署 profile 时使用 `--config /absolute/or/relative/profile.yaml`；`--config` 覆盖的是
+默认 profile 路径，而不是把一长串 RTC 参数重新暴露到命令行。只保留 `--config` 与少量运维
+覆盖（如日志级别、dry-run）。旧的 `--enable-rtc`、
 `--rtc-beta`、`--rtc-s-min`、`--rtc-model-action-*`、`--prefetch-*`、`--execute-steps` 将删除；
 它们迁移到 YAML 或由 policy metadata 推导。
 
@@ -307,7 +324,7 @@ uv run examples/spirit-ai/main.py --config examples/spirit-ai/configs/rtc/traini
 | 模型数学 | `d=0` 等价普通损失；prefix 输入始终不变；postfix-only loss 归一化正确；per-token AdaRMS shape 与旧 checkpoint load 正确 |
 | API | `rtc_action_prefix/delay` 的 shape、dtype、范围验证；WebSocket envelope 往返；metadata 能力校验 |
 | 时间线 | `A[s:s+d]` 正确成为 `B` prefix；`d_actual<=d_plan` 无缝切换；miss 结果绝不采用；horizon 违反进入 hold |
-| 配置 | YAML 严格解析、CLI 只接受 config、训练 config 默认关闭、RTC 只能用于 JAX Pi0.5 |
+| 配置 | 默认 YAML 路径以 `__file__` 解析、`--config` 可覆盖、YAML 严格解析、训练 config 默认关闭、RTC 只能用于 JAX Pi0.5 |
 | SpiritAI 安全 | 单步 command 仍经过现有 blend、rollback guard 与 motion limit；robot ack 拒绝不会推进 logical tick |
 | 集成/硬件 dry-run | fake clock + fake policy 延迟；真实 robot 不使能执行的 RPC budget profile；之后才做低速 RTC smoke test |
 
@@ -331,5 +348,6 @@ uv run examples/spirit-ai/main.py --config examples/spirit-ai/configs/rtc/traini
 
 1. 一期按 training-time RTC 唯一路径推进，VJP/soft mask 不实现；
 2. RTC 模式采用单步 command dispatcher，不依赖 robot server 支持队列/抢占；
-3. 新 SpiritAI 执行参数全部进入 YAML，模型维度和训练 delay capability 从 server metadata 获取；
-4. `max_delay_steps` 的最终数值以部署前 latency profile 为准，而非现在猜测一个固定值。
+3. 默认 YAML 位于 `main.py` 的稳定相对路径，`--config` 可选择其他 profile；YAML 仅在 `main()` 中加载；
+4. 新 SpiritAI 执行参数全部进入 YAML，模型维度和训练 delay capability 从 server metadata 获取；
+5. `max_delay_steps` 的最终数值以部署前 latency profile 为准，而非现在猜测一个固定值。
