@@ -113,3 +113,90 @@ def test_close_waits_rejects_later_submits_and_is_idempotent():
     worker.close()
     with pytest.raises(RuntimeError, match="closed"):
         worker.submit("later")
+
+
+def test_close_from_its_own_inference_thread_is_rejected_without_closing():
+    shutdown_callers: list[threading.Thread] = []
+
+    def infer(request: str) -> str:
+        with pytest.raises(RuntimeError, match="own inference thread"):
+            worker.close()
+        return request.upper()
+
+    worker = RTCInferenceWorker(infer)
+    original_shutdown = worker._executor.shutdown  # noqa: SLF001
+
+    def record_shutdown(*, wait: bool, cancel_futures: bool) -> None:
+        assert wait is True
+        assert cancel_futures is False
+        shutdown_callers.append(threading.current_thread())
+        original_shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    worker._executor.shutdown = record_shutdown  # noqa: SLF001
+
+    assert worker.submit("self-close").result(timeout=1).value == "SELF-CLOSE"
+    assert shutdown_callers == []
+
+    worker.close()
+
+    assert shutdown_callers == [threading.current_thread()]
+
+
+def test_concurrent_external_closes_wait_and_block_new_submissions():
+    started = threading.Event()
+    allow_finish = threading.Event()
+    shutdown_started = threading.Event()
+    second_close_waiting = threading.Event()
+    first_close_returned = threading.Event()
+    second_close_returned = threading.Event()
+
+    def infer(request: str) -> str:
+        started.set()
+        assert allow_finish.wait(timeout=1)
+        return request.upper()
+
+    worker = RTCInferenceWorker(infer)
+    original_shutdown = worker._executor.shutdown  # noqa: SLF001
+    original_wait = worker._close_complete.wait  # noqa: SLF001
+
+    def record_shutdown(*, wait: bool, cancel_futures: bool) -> None:
+        assert wait is True
+        assert cancel_futures is False
+        shutdown_started.set()
+        original_shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def record_wait(timeout: float | None = None) -> bool:
+        second_close_waiting.set()
+        return original_wait(timeout)
+
+    worker._executor.shutdown = record_shutdown  # noqa: SLF001
+    worker._close_complete.wait = record_wait  # noqa: SLF001
+    future = worker.submit("close")
+    assert started.wait(timeout=1)
+
+    first_close = threading.Thread(target=lambda: (worker.close(), first_close_returned.set()))
+    second_close = threading.Thread(target=lambda: (worker.close(), second_close_returned.set()))
+    try:
+        first_close.start()
+        assert shutdown_started.wait(timeout=1)
+        with pytest.raises(RuntimeError, match="closed"):
+            worker.submit("later")
+
+        second_close.start()
+        assert second_close_waiting.wait(timeout=1)
+        assert not first_close_returned.is_set()
+        assert not second_close_returned.is_set()
+
+        allow_finish.set()
+        first_close.join(timeout=1)
+        second_close.join(timeout=1)
+
+        assert not first_close.is_alive()
+        assert not second_close.is_alive()
+        assert first_close_returned.is_set()
+        assert second_close_returned.is_set()
+        assert future.result(timeout=1).value == "CLOSE"
+    finally:
+        allow_finish.set()
+        first_close.join(timeout=1)
+        second_close.join(timeout=1)

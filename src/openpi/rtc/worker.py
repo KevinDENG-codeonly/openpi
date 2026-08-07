@@ -37,6 +37,7 @@ class RTCInferenceWorker(Generic[RequestT, ValueT]):
         self._closed = False
         self._close_complete = threading.Event()
         self._lock = threading.Lock()
+        self._inference_thread: threading.Thread | None = None
 
     def submit(self, request: RequestT) -> Future[RTCInferenceResult[ValueT]]:
         """Start inference unless a request is already in flight."""
@@ -50,6 +51,8 @@ class RTCInferenceWorker(Generic[RequestT, ValueT]):
 
     def close(self) -> None:
         """Wait for submitted inference to finish and release the worker thread."""
+        if threading.current_thread() is self._inference_thread:
+            raise RuntimeError("RTC inference worker cannot be closed from its own inference thread")
         with self._lock:
             if self._closed:
                 should_shutdown = False
@@ -65,6 +68,7 @@ class RTCInferenceWorker(Generic[RequestT, ValueT]):
             self._close_complete.wait()
 
     def _run(self, request: RequestT) -> RTCInferenceResult[ValueT]:
+        self._inference_thread = threading.current_thread()
         started_at = time.monotonic()
         try:
             value = self._infer(request)
