@@ -1,0 +1,35 @@
+schema_version: 1
+policy: {host: localhost, port: 8000, prompt: fold the paper box}
+robot:
+  url: ws://172.16.0.30:8766
+  action_layout: cartesian
+  enable_external_following: false
+  initial_gripper_obs_state: 0.0965
+  gripper_initial_tolerance: 0.00965
+  gripper_reset_command_state: 1.0
+  gripper_reset_steps: 10
+control:
+  source_hz: 15.0
+  max_steps: 2000
+  busy_sleep_s: 0.01
+  startup_delay_s: 10.0
+  blend_steps: 4
+  rollback_guard_steps: 4
+  rollback_scale: 0.2
+  rpc_budget_fraction: 0.7
+  motion_limits:
+    max_arm_velocity_rad_s: 0.35
+    max_torso_velocity_rad_s: 0.2
+    max_gripper_velocity_s: 0.8
+    max_base_speed: 0.05
+    max_joint_accel_rad_s2: 0.0
+    max_cart_translation_m_s: 0.08
+    max_cart_rotation_rad_s: 0.35
+    max_torso_cart_translation_m_s: 0.04
+    max_torso_cart_rotation_rad_s: 0.2
+    max_cart_accel: 0.0
+rtc:
+  mode: training_time
+  s_min: 5
+  delay: {planned_max_steps: 12, history_window: 16, safety_margin_steps: 1}
+  deadline_miss: {max_consecutive: 2, action: hold_then_stop}
