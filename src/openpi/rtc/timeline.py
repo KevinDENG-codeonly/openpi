@@ -200,18 +200,19 @@ class RTCController:
         completion_tick = _nonnegative_integer(completion_tick, "completion_tick")
         if self.inflight_request is None:
             raise RTCStateError("no RTC request is in flight")
-        if request.request_id != self.inflight_request.request_id:
+        inflight_request = self.inflight_request
+        if request.request_id != inflight_request.request_id:
             raise RTCStateError("stale or mismatched request cannot complete")
-        if completion_tick < request.start_tick:
+        if completion_tick < inflight_request.start_tick:
             raise RTCStateError("completion_tick cannot be before request.start_tick")
 
-        actual_delay = completion_tick - request.start_tick
-        if actual_delay > request.planned_delay_steps:
+        actual_delay = completion_tick - inflight_request.start_tick
+        if actual_delay > inflight_request.planned_delay_steps:
             self.inflight_request = None
             self.deadline_miss_count += 1
             self.consecutive_deadline_misses += 1
             return False
-        if result_plan.generation_tick != request.start_tick:
+        if result_plan.generation_tick != inflight_request.start_tick:
             raise RTCStateError("result_plan.generation_tick must equal request.start_tick")
 
         self._validate_plan_dimensions(result_plan)

@@ -256,6 +256,54 @@ def test_accept_result_rejects_stale_requests_and_wrong_generation_ticks():
     assert controller.accept_result(reconstructed_request, make_plan(generation_tick=11), completion_tick=11) is True
 
 
+def test_accept_result_uses_stored_request_timing_after_matching_request_id():
+    old_plan = make_plan(generation_tick=10)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=11, planned_delay_steps=1)
+    forged_frozen_prefix = np.full((5, 2), 42.0, dtype=np.float32)
+    forged_action_prefix = np.zeros((8, 2), dtype=np.float32)
+    forged_action_prefix[:5] = forged_frozen_prefix
+    forged_request = RTCRequest(
+        request_id=request.request_id,
+        source_generation_tick=request.source_generation_tick,
+        start_tick=20,
+        planned_delay_steps=5,
+        execution_horizon=5,
+        action_prefix=forged_action_prefix,
+        frozen_prefix=forged_frozen_prefix,
+    )
+
+    assert controller.accept_result(forged_request, make_plan(generation_tick=11), completion_tick=13) is False
+
+    assert controller.active_plan is old_plan
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 1
+    assert controller.consecutive_deadline_misses == 1
+
+
+def test_accept_result_uses_stored_generation_after_matching_request_id():
+    old_plan = make_plan(generation_tick=10)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=11, planned_delay_steps=1)
+    forged_request = RTCRequest(
+        request_id=request.request_id,
+        source_generation_tick=request.source_generation_tick,
+        start_tick=12,
+        planned_delay_steps=request.planned_delay_steps,
+        execution_horizon=request.execution_horizon,
+        action_prefix=request.action_prefix,
+        frozen_prefix=request.frozen_prefix,
+    )
+
+    with pytest.raises(RTCStateError, match="generation_tick"):
+        controller.accept_result(forged_request, make_plan(generation_tick=12), completion_tick=11)
+
+    assert controller.active_plan is old_plan
+    assert controller.inflight_request is request
+
+
 def test_action_for_tick_holds_when_the_active_plan_is_exhausted():
     controller = RTCController(action_horizon=2, action_dim=2, s_min=0, training_max_delay_steps=1)
     controller.install_initial_plan(make_plan(generation_tick=5, horizon=2))
