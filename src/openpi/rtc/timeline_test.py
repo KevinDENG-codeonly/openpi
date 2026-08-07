@@ -7,6 +7,7 @@ from openpi.rtc import ActionPlan
 from openpi.rtc import RTCController
 from openpi.rtc import RTCRequest
 from openpi.rtc import RTCStateError
+from openpi.rtc.capabilities import validate_training_time_request
 
 
 def make_plan(
@@ -28,6 +29,15 @@ def test_install_initial_plan_installs_the_controller_plan():
     assert controller.active_plan is plan
 
 
+def test_install_plan_remains_a_compatible_initial_plan_alias():
+    plan = make_plan()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
+
+    controller.install_plan(plan)
+
+    assert controller.active_plan is plan
+
+
 def test_start_request_uses_exact_shifted_prefix():
     plan = make_plan()
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
@@ -38,7 +48,10 @@ def test_start_request_uses_exact_shifted_prefix():
     assert request.start_tick == 12
     assert request.execution_horizon == 2
     assert request.planned_delay_steps == 2
-    np.testing.assert_array_equal(request.action_prefix, plan.model_actions[2:4])
+    np.testing.assert_array_equal(request.frozen_prefix, plan.model_actions[2:4])
+    assert request.action_prefix.shape == (8, 2)
+    np.testing.assert_array_equal(request.action_prefix[:2], request.frozen_prefix)
+    np.testing.assert_array_equal(request.action_prefix[2:], 0.0)
 
 
 def test_start_request_preserves_an_empty_prefix_for_zero_delay():
@@ -49,8 +62,44 @@ def test_start_request_preserves_an_empty_prefix_for_zero_delay():
     request = controller.start_request(current_tick=11, planned_delay_steps=0)
 
     assert request.execution_horizon == 1
-    assert request.action_prefix.shape == (0, 2)
-    np.testing.assert_array_equal(request.action_prefix, plan.model_actions[1:1])
+    assert request.frozen_prefix.shape == (0, 2)
+    np.testing.assert_array_equal(request.frozen_prefix, plan.model_actions[1:1])
+    assert request.action_prefix.shape == (8, 2)
+    np.testing.assert_array_equal(request.action_prefix, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("planned_delay_steps", "current_tick"),
+    [(2, 12), (0, 11)],
+)
+def test_request_action_prefix_is_a_policy_valid_full_horizon_envelope(
+    planned_delay_steps: int, current_tick: int
+):
+    plan = make_plan()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
+    controller.install_initial_plan(plan)
+    request = controller.start_request(
+        current_tick=current_tick,
+        planned_delay_steps=planned_delay_steps,
+    )
+
+    action_prefix, delay_steps = validate_training_time_request(
+        {
+            "algorithm": "training_time_v1",
+            "action_prefix": request.action_prefix,
+            "delay_steps": request.planned_delay_steps,
+        },
+        {
+            "algorithm": "training_time_v1",
+            "action_horizon": 8,
+            "action_dim": 2,
+            "training_max_delay_steps": 4,
+        },
+    )
+
+    assert delay_steps == planned_delay_steps
+    np.testing.assert_array_equal(action_prefix[:planned_delay_steps], request.frozen_prefix)
+    np.testing.assert_array_equal(action_prefix[planned_delay_steps:], 0.0)
 
 
 def test_start_request_uses_s_min_when_it_exceeds_the_planned_delay():
@@ -61,7 +110,9 @@ def test_start_request_uses_s_min_when_it_exceeds_the_planned_delay():
     request = controller.start_request(current_tick=13, planned_delay_steps=1)
 
     assert request.execution_horizon == 3
-    np.testing.assert_array_equal(request.action_prefix, plan.model_actions[3:4])
+    np.testing.assert_array_equal(request.frozen_prefix, plan.model_actions[3:4])
+    np.testing.assert_array_equal(request.action_prefix[:1], request.frozen_prefix)
+    np.testing.assert_array_equal(request.action_prefix[1:], 0.0)
 
 
 def test_start_request_rejects_delay_that_exhausts_the_remaining_horizon():
@@ -117,6 +168,32 @@ def test_late_result_records_a_deadline_miss_and_keeps_the_old_plan():
     assert controller.consecutive_deadline_misses == 1
 
 
+def test_accept_result_rejects_completion_before_the_request_start_tick():
+    old_plan = make_plan(generation_tick=10)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=11, planned_delay_steps=1)
+
+    with pytest.raises(RTCStateError, match="before request.start_tick"):
+        controller.accept_result(request, make_plan(generation_tick=11), completion_tick=10)
+
+    assert controller.active_plan is old_plan
+    assert controller.inflight_request is request
+    assert controller.deadline_miss_count == 0
+    assert controller.consecutive_deadline_misses == 0
+
+
+def test_accept_result_accepts_completion_at_the_planned_delay_boundary():
+    old_plan = make_plan(generation_tick=10)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=12, planned_delay_steps=2)
+    result_plan = make_plan(generation_tick=12)
+
+    assert controller.accept_result(request, result_plan, completion_tick=14) is True
+    assert controller.active_plan is result_plan
+
+
 def test_on_time_result_switches_after_a_frozen_prefix():
     old_plan = make_plan(generation_tick=10)
     controller = RTCController(action_horizon=8, action_dim=2, s_min=2, training_max_delay_steps=4)
@@ -148,6 +225,15 @@ def test_accept_result_rejects_stale_requests_and_wrong_generation_ticks():
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=4)
     controller.install_initial_plan(old_plan)
     request = controller.start_request(current_tick=11, planned_delay_steps=1)
+    reconstructed_request = RTCRequest(
+        request_id=request.request_id,
+        source_generation_tick=request.source_generation_tick,
+        start_tick=request.start_tick,
+        planned_delay_steps=request.planned_delay_steps,
+        execution_horizon=request.execution_horizon,
+        action_prefix=request.action_prefix,
+        frozen_prefix=request.frozen_prefix,
+    )
     stale_request = RTCRequest(
         request_id=request.request_id + 1,
         source_generation_tick=request.source_generation_tick,
@@ -155,6 +241,7 @@ def test_accept_result_rejects_stale_requests_and_wrong_generation_ticks():
         planned_delay_steps=request.planned_delay_steps,
         execution_horizon=request.execution_horizon,
         action_prefix=request.action_prefix,
+        frozen_prefix=request.frozen_prefix,
     )
 
     with pytest.raises(RTCStateError, match="stale or mismatched request"):
@@ -162,9 +249,11 @@ def test_accept_result_rejects_stale_requests_and_wrong_generation_ticks():
     assert controller.inflight_request is request
 
     with pytest.raises(RTCStateError, match="generation_tick"):
-        controller.accept_result(request, make_plan(generation_tick=12), completion_tick=11)
+        controller.accept_result(reconstructed_request, make_plan(generation_tick=12), completion_tick=11)
     assert controller.inflight_request is request
     assert controller.active_plan is old_plan
+
+    assert controller.accept_result(reconstructed_request, make_plan(generation_tick=11), completion_tick=11) is True
 
 
 def test_action_for_tick_holds_when_the_active_plan_is_exhausted():
@@ -176,6 +265,56 @@ def test_action_for_tick_holds_when_the_active_plan_is_exhausted():
     assert dispatch.kind == "hold"
     assert dispatch.model_action is None
     assert dispatch.robot_action is None
+
+
+def test_action_plan_and_request_own_immutable_arrays_and_dispatch_copies_actions():
+    model_actions = np.arange(16, dtype=np.float32).reshape(8, 2)
+    robot_actions = np.arange(24, dtype=np.float32).reshape(8, 3)
+    expected_model_actions = model_actions.copy()
+    expected_robot_actions = robot_actions.copy()
+    plan = ActionPlan(
+        generation_tick=10,
+        model_actions=model_actions,
+        robot_actions=robot_actions,
+    )
+    frozen_prefix = expected_model_actions[2:4].copy()
+    action_prefix = np.zeros((8, 2), dtype=np.float32)
+    action_prefix[:2] = frozen_prefix
+    request = RTCRequest(
+        request_id=0,
+        source_generation_tick=10,
+        start_tick=12,
+        planned_delay_steps=2,
+        execution_horizon=2,
+        action_prefix=action_prefix,
+        frozen_prefix=frozen_prefix,
+    )
+
+    model_actions[:] = -1.0
+    robot_actions[:] = -1.0
+    action_prefix[:] = -1.0
+    frozen_prefix[:] = -1.0
+
+    np.testing.assert_array_equal(plan.model_actions, expected_model_actions)
+    np.testing.assert_array_equal(plan.robot_actions, expected_robot_actions)
+    np.testing.assert_array_equal(request.frozen_prefix, expected_model_actions[2:4])
+    np.testing.assert_array_equal(request.action_prefix[:2], expected_model_actions[2:4])
+    assert not plan.model_actions.flags.writeable
+    assert not plan.robot_actions.flags.writeable
+    assert not request.action_prefix.flags.writeable
+    assert not request.frozen_prefix.flags.writeable
+
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(plan)
+    dispatch = controller.action_for_tick(10)
+    assert dispatch.model_action is not None
+    assert dispatch.robot_action is not None
+    dispatch.model_action[:] = -2.0
+    dispatch.robot_action[:] = -2.0
+
+    next_dispatch = controller.action_for_tick(10)
+    np.testing.assert_array_equal(next_dispatch.model_action, expected_model_actions[0])
+    np.testing.assert_array_equal(next_dispatch.robot_action, expected_robot_actions[0])
 
 
 @pytest.mark.parametrize(
@@ -222,7 +361,7 @@ def test_only_accepted_robot_acknowledgements_advance_the_logical_tick():
     old_plan = make_plan(generation_tick=0)
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
     controller.install_initial_plan(old_plan)
-    request = controller.start_request(current_tick=1, planned_delay_steps=0)
+    request = controller.start_request(current_tick=1, planned_delay_steps=1)
     assert controller.accept_result(request, make_plan(generation_tick=1), completion_tick=1) is True
     controller.action_for_tick(1)
 

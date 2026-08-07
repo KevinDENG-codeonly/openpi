@@ -25,6 +25,12 @@ def _positive_integer(value: int, name: str) -> int:
     return int(value)
 
 
+def _immutable_array_copy(array: np.ndarray) -> np.ndarray:
+    owned_array = array.copy()
+    owned_array.setflags(write=False)
+    return owned_array
+
+
 @dataclasses.dataclass(frozen=True)
 class ActionPlan:
     """Model and robot action chunks generated for a single logical tick."""
@@ -41,11 +47,17 @@ class ActionPlan:
             raise RTCStateError("robot_actions must be a rank-2 numpy array")
         if self.model_actions.shape[0] != self.robot_actions.shape[0]:
             raise RTCStateError("model_actions and robot_actions must have matching horizons")
+        object.__setattr__(self, "model_actions", _immutable_array_copy(self.model_actions))
+        object.__setattr__(self, "robot_actions", _immutable_array_copy(self.robot_actions))
 
 
 @dataclasses.dataclass(frozen=True)
 class RTCRequest:
-    """A single inference request tied to the action plan that created it."""
+    """A request with a stable identity across an in-process asynchronous boundary.
+
+    ``request_id`` identifies the current request even when the request object is
+    reconstructed by another in-process asynchronous component.
+    """
 
     request_id: int
     source_generation_tick: int
@@ -53,6 +65,7 @@ class RTCRequest:
     planned_delay_steps: int
     execution_horizon: int
     action_prefix: np.ndarray
+    frozen_prefix: np.ndarray
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "request_id", _nonnegative_integer(self.request_id, "request_id"))
@@ -74,8 +87,20 @@ class RTCRequest:
         )
         if not isinstance(self.action_prefix, np.ndarray) or self.action_prefix.ndim != 2:
             raise RTCStateError("action_prefix must be a rank-2 numpy array")
-        if self.action_prefix.shape[0] != self.planned_delay_steps:
-            raise RTCStateError("action_prefix horizon must match planned_delay_steps")
+        if not isinstance(self.frozen_prefix, np.ndarray) or self.frozen_prefix.ndim != 2:
+            raise RTCStateError("frozen_prefix must be a rank-2 numpy array")
+        if self.frozen_prefix.shape[0] != self.planned_delay_steps:
+            raise RTCStateError("frozen_prefix horizon must match planned_delay_steps")
+        if self.action_prefix.shape[0] < self.planned_delay_steps:
+            raise RTCStateError("action_prefix must contain the full frozen prefix")
+        if self.action_prefix.shape[1] != self.frozen_prefix.shape[1]:
+            raise RTCStateError("action_prefix and frozen_prefix must have matching action dimensions")
+        if not np.array_equal(self.action_prefix[: self.planned_delay_steps], self.frozen_prefix):
+            raise RTCStateError("action_prefix must start with frozen_prefix")
+        if not np.all(self.action_prefix[self.planned_delay_steps :] == 0.0):
+            raise RTCStateError("action_prefix must be zero-filled outside frozen_prefix")
+        object.__setattr__(self, "action_prefix", _immutable_array_copy(self.action_prefix))
+        object.__setattr__(self, "frozen_prefix", _immutable_array_copy(self.frozen_prefix))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,13 +176,20 @@ class RTCController:
         if planned_delay_steps > self.action_horizon - s:
             raise RTCStateError("planned_delay_steps exceeds the remaining action horizon")
 
+        frozen_prefix = self.active_plan.model_actions[s : s + planned_delay_steps]
+        action_prefix = np.zeros(
+            (self.action_horizon, self.action_dim),
+            dtype=self.active_plan.model_actions.dtype,
+        )
+        action_prefix[:planned_delay_steps] = frozen_prefix
         request = RTCRequest(
             request_id=self._next_request_id,
             source_generation_tick=self.active_plan.generation_tick,
             start_tick=current_tick,
             planned_delay_steps=planned_delay_steps,
             execution_horizon=s,
-            action_prefix=self.active_plan.model_actions[s : s + planned_delay_steps].copy(),
+            action_prefix=action_prefix,
+            frozen_prefix=frozen_prefix,
         )
         self._next_request_id += 1
         self.inflight_request = request
@@ -168,8 +200,10 @@ class RTCController:
         completion_tick = _nonnegative_integer(completion_tick, "completion_tick")
         if self.inflight_request is None:
             raise RTCStateError("no RTC request is in flight")
-        if request is not self.inflight_request:
+        if request.request_id != self.inflight_request.request_id:
             raise RTCStateError("stale or mismatched request cannot complete")
+        if completion_tick < request.start_tick:
+            raise RTCStateError("completion_tick cannot be before request.start_tick")
 
         actual_delay = completion_tick - request.start_tick
         if actual_delay > request.planned_delay_steps:
@@ -197,8 +231,8 @@ class RTCController:
             return DispatchAction(kind="hold")
         return DispatchAction(
             kind="action",
-            model_action=self.active_plan.model_actions[index],
-            robot_action=self.active_plan.robot_actions[index],
+            model_action=self.active_plan.model_actions[index].copy(),
+            robot_action=self.active_plan.robot_actions[index].copy(),
         )
 
     def record_accepted_tick(self, *, acknowledged: bool) -> int:
