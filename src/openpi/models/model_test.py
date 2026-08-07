@@ -47,7 +47,7 @@ def test_pi05_model_supports_tokenwise_rtc_conditioning():
     with pytest.raises(ValueError, match="rtc_max_delay_steps.*action_horizon"):
         model.compute_loss(key, obs, actions, rtc_max_delay_steps=config.action_horizon)
 
-    loss = model.compute_loss(key, obs, actions, rtc_max_delay_steps=2)
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, actions, rtc_max_delay_steps=2)
     assert loss.shape == (1, config.action_horizon)
     assert jnp.all(jnp.isfinite(loss))
 

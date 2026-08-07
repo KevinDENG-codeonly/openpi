@@ -201,7 +201,7 @@ class Pi0(_model.BaseModel):
         train: bool = False,
         rtc_max_delay_steps: int | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
-        if rtc_max_delay_steps is not None and rtc_max_delay_steps >= self.action_horizon:
+        if isinstance(rtc_max_delay_steps, int) and rtc_max_delay_steps >= self.action_horizon:
             raise ValueError(
                 f"rtc_max_delay_steps ({rtc_max_delay_steps}) must be less than "
                 f"action_horizon ({self.action_horizon})"
@@ -223,7 +223,8 @@ class Pi0(_model.BaseModel):
             batch_shape = actions.shape[:-2]
             noise = jax.random.normal(noise_rng, actions.shape)
             scalar_time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-            delay_steps = jax.random.randint(delay_rng, batch_shape, 0, rtc_max_delay_steps + 1)
+            max_delay_steps = jnp.minimum(rtc_max_delay_steps, self.action_horizon - 1)
+            delay_steps = jax.random.randint(delay_rng, batch_shape, 0, max_delay_steps + 1)
             x_t, token_time, postfix_mask = conditioning.prepare_training_inputs(
                 actions, noise, scalar_time, delay_steps
             )
