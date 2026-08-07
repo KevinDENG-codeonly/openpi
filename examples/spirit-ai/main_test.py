@@ -16,6 +16,7 @@ from uuid import uuid4
 import numpy as np
 import pytest
 
+from openpi.policies import spiritai_bridge
 from openpi.rtc import ActionPlan
 from openpi.rtc import RTCController
 from openpi.rtc import RTCRequest
@@ -291,6 +292,96 @@ def test_terminal_hold_ack_timeout_uses_bound_without_advancing_tick():
             TimeoutRobotSocket(),
             timeout_s=0.25,
             operation="terminal hold",
+        )
+
+    assert received_timeouts == [0.25]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
+    main = load_main_module()
+    connection = object()
+    connect_calls = []
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr(main.websockets.sync.client, "connect", connect)
+
+    assert main._open_robot_connection("ws://robot", timeout_s=0.25) is connection  # noqa: SLF001
+    assert connect_calls == [
+        (
+            ("ws://robot",),
+            {"max_size": None, "compression": None, "open_timeout": 0.25},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("invoke", "expected_message_type", "timeout_message"),
+    [
+        (
+            lambda main, socket: main._wait_until_robot_idle(socket, 0.0, timeout_s=0.25),  # noqa: SLF001
+            "get_status",
+            "robot status response timed out after 0.25s",
+        ),
+        (
+            lambda main, socket: main._get_robot_obs(socket, timeout_s=0.25),  # noqa: SLF001
+            "get_obs",
+            "robot observation response timed out after 0.25s",
+        ),
+        (
+            lambda main, socket: main._set_robot_external_following(socket, enabled=True, timeout_s=0.25),  # noqa: SLF001
+            "set_external_following",
+            "external-following response timed out after 0.25s",
+        ),
+    ],
+)
+def test_robot_preflight_recv_timeout_is_bounded_before_any_command_or_tick(
+    invoke, expected_message_type, timeout_message
+):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+
+    class TimeoutRobotSocket:
+        def __init__(self):
+            self.sent = []
+            self.received_timeouts = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self, *, timeout):
+            self.received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    robot_ws = TimeoutRobotSocket()
+    with pytest.raises(RuntimeError, match=timeout_message):
+        invoke(main, robot_ws)
+
+    assert robot_ws.received_timeouts == [0.25]
+    assert [spiritai_bridge.unpack_robot_server_message(message)["type"] for message in robot_ws.sent] == [
+        expected_message_type
+    ]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_hello_recv_timeout_is_bounded_before_any_command_or_tick():
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    received_timeouts = []
+
+    class TimeoutRobotSocket:
+        def recv(self, *, timeout):
+            received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    with pytest.raises(RuntimeError, match="robot hello timed out after 0.25s"):
+        main._recv_robot_response(  # noqa: SLF001
+            TimeoutRobotSocket(),
+            timeout_s=0.25,
+            operation="robot hello",
         )
 
     assert received_timeouts == [0.25]

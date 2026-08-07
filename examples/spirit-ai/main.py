@@ -151,18 +151,58 @@ def validate_rtc_runtime_metadata(runtime: RuntimeConfig, metadata: Mapping[str,
     )
 
 
-def _wait_until_robot_idle(robot_ws: websockets.sync.client.ClientConnection, busy_sleep_s: float) -> None:
+def _open_robot_connection(
+    robot_url: str, *, timeout_s: float
+) -> websockets.sync.client.ClientConnection:
+    """Open the robot transport with the same bound used for robot responses."""
+    return websockets.sync.client.connect(
+        robot_url,
+        max_size=None,
+        compression=None,
+        open_timeout=timeout_s,
+    )
+
+
+def _recv_robot_response(
+    robot_ws: websockets.sync.client.ClientConnection,
+    *,
+    timeout_s: float,
+    operation: str,
+) -> dict:
+    """Receive one robot response within the configured safety bound."""
+    try:
+        return spiritai_bridge.unpack_robot_server_message(robot_ws.recv(timeout=timeout_s))
+    except TimeoutError as exc:
+        raise RuntimeError(f"{operation} timed out after {timeout_s:g}s") from exc
+
+
+def _wait_until_robot_idle(
+    robot_ws: websockets.sync.client.ClientConnection,
+    busy_sleep_s: float,
+    *,
+    timeout_s: float,
+) -> None:
     while True:
         robot_ws.send(spiritai_bridge.pack_robot_server_message({"type": "get_status"}))
-        status = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+        status = _recv_robot_response(
+            robot_ws,
+            timeout_s=timeout_s,
+            operation="robot status response",
+        )
         if not status["busy"]:
             return
         time.sleep(busy_sleep_s)
 
 
-def _get_robot_obs(robot_ws: websockets.sync.client.ClientConnection) -> tuple[dict, dict]:
+def _get_robot_obs(
+    robot_ws: websockets.sync.client.ClientConnection, *, timeout_s: float
+) -> tuple[dict, dict]:
     robot_ws.send(spiritai_bridge.pack_robot_server_message({"type": "get_obs"}))
-    msg = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+    msg = _recv_robot_response(
+        robot_ws,
+        timeout_s=timeout_s,
+        operation="robot observation response",
+    )
     if msg.get("type") not in (None, "obs"):
         raise spiritai_bridge.RobotServerProtocolError(f"Unexpected get_obs response: {msg.get('type')}")
     return msg["obs"], msg["images"]
@@ -175,15 +215,18 @@ def _wait_for_robot_command_ack(
     operation: str,
 ) -> dict:
     """Receive one command acknowledgement within the configured safety bound."""
-    try:
-        return spiritai_bridge.unpack_robot_server_message(robot_ws.recv(timeout=timeout_s))
-    except TimeoutError as exc:
-        raise RuntimeError(f"{operation} ACK timed out after {timeout_s:g}s") from exc
+    return _recv_robot_response(robot_ws, timeout_s=timeout_s, operation=f"{operation} ACK")
 
 
-def _set_robot_external_following(robot_ws: websockets.sync.client.ClientConnection, *, enabled: bool) -> None:
+def _set_robot_external_following(
+    robot_ws: websockets.sync.client.ClientConnection, *, enabled: bool, timeout_s: float
+) -> None:
     robot_ws.send(spiritai_bridge.pack_robot_server_message({"type": "set_external_following", "enabled": enabled}))
-    msg = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+    msg = _recv_robot_response(
+        robot_ws,
+        timeout_s=timeout_s,
+        operation="external-following response",
+    )
     if msg.get("type") == "error":
         raise spiritai_bridge.RobotServerProtocolError(
             f"robot_server rejected set_external_following: {msg.get('code')} {msg.get('message')}"
@@ -670,7 +713,10 @@ def main(args: BootstrapArgs) -> None:
     )
 
     with _robot_session_with_policy_cleanup(
-        websockets.sync.client.connect(runtime.robot.url, max_size=None, compression=None),
+        _open_robot_connection(
+            runtime.robot.url,
+            timeout_s=runtime.control.command_ack_timeout_s,
+        ),
         policy_worker,
         wait_for_policy=lambda: _policy_worker_cleanup_can_wait(
             bootstrap_future=bootstrap_future,
@@ -678,7 +724,11 @@ def main(args: BootstrapArgs) -> None:
             flight=flight,
         ),
     ) as robot_ws:
-        hello = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
+        hello = _recv_robot_response(
+            robot_ws,
+            timeout_s=runtime.control.command_ack_timeout_s,
+            operation="robot hello",
+        )
         if hello.get("type") != "hello":
             raise spiritai_bridge.RobotServerProtocolError(
                 f"Expected hello from robot_server, got: {hello.get('type')}"
@@ -705,7 +755,11 @@ def main(args: BootstrapArgs) -> None:
             robot_metadata.get("cameras"),
         )
         if runtime.robot.enable_external_following:
-            _set_robot_external_following(robot_ws, enabled=True)
+            _set_robot_external_following(
+                robot_ws,
+                enabled=True,
+                timeout_s=runtime.control.command_ack_timeout_s,
+            )
         if runtime.control.startup_delay_s > 0:
             logging.info("Startup delay %.1fs before first inference.", runtime.control.startup_delay_s)
             time.sleep(runtime.control.startup_delay_s)
@@ -734,8 +788,15 @@ def main(args: BootstrapArgs) -> None:
         )
 
         initial_preflight_started_at = time.perf_counter()
-        _wait_until_robot_idle(robot_ws, runtime.control.busy_sleep_s)
-        initial_obs, initial_images = _get_robot_obs(robot_ws)
+        _wait_until_robot_idle(
+            robot_ws,
+            runtime.control.busy_sleep_s,
+            timeout_s=runtime.control.command_ack_timeout_s,
+        )
+        initial_obs, initial_images = _get_robot_obs(
+            robot_ws,
+            timeout_s=runtime.control.command_ack_timeout_s,
+        )
         logging.info("Initial robot read-only preflight latency: %.3fs", time.perf_counter() - initial_preflight_started_at)
         left_gripper, right_gripper = _get_gripper_state(initial_obs)
         if _grippers_at_initial_state(
@@ -773,8 +834,15 @@ def main(args: BootstrapArgs) -> None:
             )
             if reset_sent:
                 verify_preflight_started_at = time.perf_counter()
-                _wait_until_robot_idle(robot_ws, runtime.control.busy_sleep_s)
-                initial_obs, initial_images = _get_robot_obs(robot_ws)
+                _wait_until_robot_idle(
+                    robot_ws,
+                    runtime.control.busy_sleep_s,
+                    timeout_s=runtime.control.command_ack_timeout_s,
+                )
+                initial_obs, initial_images = _get_robot_obs(
+                    robot_ws,
+                    timeout_s=runtime.control.command_ack_timeout_s,
+                )
                 logging.info(
                     "Initial reset verification read-only latency: %.3fs",
                     time.perf_counter() - verify_preflight_started_at,
@@ -827,8 +895,15 @@ def main(args: BootstrapArgs) -> None:
         try:
             for _loop_step in range(runtime.control.max_steps):
                 read_only_started_at = time.perf_counter()
-                _wait_until_robot_idle(robot_ws, runtime.control.busy_sleep_s)
-                obs, images = _get_robot_obs(robot_ws)
+                _wait_until_robot_idle(
+                    robot_ws,
+                    runtime.control.busy_sleep_s,
+                    timeout_s=runtime.control.command_ack_timeout_s,
+                )
+                obs, images = _get_robot_obs(
+                    robot_ws,
+                    timeout_s=runtime.control.command_ack_timeout_s,
+                )
                 read_only_duration_s = time.perf_counter() - read_only_started_at
                 current_tick = controller.accepted_tick
                 current_state = _current_command_state(
