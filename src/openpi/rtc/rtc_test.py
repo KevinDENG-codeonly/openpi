@@ -23,6 +23,16 @@ def test_pi0_exposes_only_training_time_rtc_arguments() -> None:
     assert not any("soft" in name or "vjp" in name for name in params)
 
 
+def test_pytorch_pi0_sampler_exposes_no_legacy_rtc_kwargs() -> None:
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+
+    params = inspect.signature(PI0Pytorch.sample_actions).parameters
+
+    assert {"device", "observation", "noise", "num_steps"} <= params.keys()
+    assert not any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    assert not any("rtc" in name or "soft" in name or "vjp" in name for name in params)
+
+
 class TestWebsocketEnvelope:
     """The policy server keeps its ordinary and training-time envelopes."""
 

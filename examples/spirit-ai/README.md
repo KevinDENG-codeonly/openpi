@@ -644,8 +644,8 @@ Cartesian data flow:
 | `ConnectionRefusedError` from policy client | Policy server not running | Start `serve_policy.py` and use the correct host/port |
 | Missing robot cameras | Thor `robot_server` metadata lacks required camera names | Check `test_connect.py` and `run_robot.sh --camera-names` |
 | Unsupported joint/cart metadata | Server accepted dims do not include bridge target dims | Check `accepted_joint_dims` / `accepted_cart_dims` |
-| `Expected Cartesian actions with shape (T, 25)` | Cartesian bridge is receiving joint-policy output | Serve a Cartesian config and pass `--policy-action-layout cartesian` |
-| `Expected actions with shape (T, 27)` | Joint bridge is receiving Cartesian-policy output | Use `--policy-action-layout cartesian` or serve a joint checkpoint |
+| `Expected Cartesian actions with shape (T, 25)` | Cartesian bridge is receiving joint-policy output | Set `robot.action_layout: cartesian` in YAML and serve a Cartesian checkpoint |
+| `Expected actions with shape (T, 27)` | Joint bridge is receiving Cartesian-policy output | Set `robot.action_layout: joint` in YAML and serve a joint checkpoint |
 | `accepted: false` ack | Server is busy or rejected command chunk | Check `docker logs -f robot_server`; reduce load and retry |
 | `ModuleNotFoundError: openpi_client` | Client package missing | Install `packages/openpi-client` or run through `uv run` from repo root |
 
