@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
+import contextlib
 import dataclasses
 import logging
 import numbers
@@ -61,6 +62,46 @@ class RTCInferenceTask:
     images: Mapping[str, object]
 
 
+@dataclasses.dataclass(frozen=True)
+class PolicyBootstrapTask:
+    """Ask the policy worker to connect and validate its RTC metadata."""
+
+
+@dataclasses.dataclass(frozen=True)
+class InitialInferenceTask:
+    """Ask the policy worker for the first action plan after robot preflight."""
+
+    obs: Mapping[str, object]
+    images: Mapping[str, object]
+
+
+PolicyWorkerTask = PolicyBootstrapTask | InitialInferenceTask | RTCInferenceTask
+PolicyWorkerResult = RTCRuntimeMetadata | ActionPlan
+
+
+@dataclasses.dataclass
+class RTCInferenceFlight:
+    """The only worker future allowed to use the policy connection at a time."""
+
+    request: RTCRequest
+    future: Future[RTCInferenceResult[ActionPlan]]
+    expired: bool = False
+
+    def expire_if_due(self, controller: RTCController, *, current_tick: int) -> bool:
+        """Release controller state once a result was not observed by its deadline."""
+        if self.expired:
+            return False
+        if controller.expire_request(self.request, current_tick=current_tick):
+            self.expired = True
+            return True
+        return False
+
+    def completed_result(self) -> RTCInferenceResult[ActionPlan] | None:
+        """Consume a completed future, discarding its result when already expired."""
+        result = self.future.result()
+        return None if self.expired else result
+
+
 def _positive_capability_integer(capability: Mapping[str, object], name: str) -> int:
     value = capability.get(name)
     if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value <= 0:
@@ -92,9 +133,9 @@ def validate_rtc_runtime_metadata(runtime: RuntimeConfig, metadata: Mapping[str,
     if (
         isinstance(planned_max_steps, bool)
         or not isinstance(planned_max_steps, numbers.Integral)
-        or planned_max_steps < 0
+        or planned_max_steps <= 0
     ):
-        raise ValueError(f"runtime.rtc.delay.planned_max_steps must be a nonnegative integer, got {planned_max_steps!r}")
+        raise ValueError(f"runtime.rtc.delay.planned_max_steps must be a positive integer, got {planned_max_steps!r}")
     if planned_max_steps > training_max_delay_steps:
         raise ValueError(
             "runtime.rtc.delay.planned_max_steps exceeds policy training_max_delay_steps: "
@@ -267,7 +308,7 @@ def _action_plan_from_chunk(
     )
 
 
-def infer_rtc_action_plan(
+def _infer_rtc_action_plan(
     policy: _websocket_client_policy.WebsocketClientPolicy,
     task: RTCInferenceTask,
     *,
@@ -295,6 +336,88 @@ def infer_rtc_action_plan(
         generation_tick=request.start_tick,
         rtc_metadata=rtc_metadata,
     )
+
+
+class PolicyRTCWorker:
+    """Own one policy connection exclusively from the RTC inference worker thread."""
+
+    def __init__(
+        self,
+        *,
+        runtime: RuntimeConfig,
+        prompt: str,
+        policy_action_layout: Literal["joint", "cartesian"],
+        policy_factory: Callable[[], _websocket_client_policy.WebsocketClientPolicy] | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._prompt = prompt
+        self._policy_action_layout = policy_action_layout
+        self._policy_factory = policy_factory or self._default_policy_factory
+        self._policy: _websocket_client_policy.WebsocketClientPolicy | None = None
+        self._rtc_metadata: RTCRuntimeMetadata | None = None
+        self._worker: RTCInferenceWorker[PolicyWorkerTask, PolicyWorkerResult] = RTCInferenceWorker(self._infer)
+
+    def submit(self, task: PolicyWorkerTask) -> Future[RTCInferenceResult[PolicyWorkerResult]]:
+        return self._worker.submit(task)
+
+    def close(self, *, wait: bool = True) -> None:
+        self._worker.close(wait=wait)
+
+    def _default_policy_factory(self) -> _websocket_client_policy.WebsocketClientPolicy:
+        return _websocket_client_policy.WebsocketClientPolicy(
+            host=self._runtime.policy.host,
+            port=self._runtime.policy.port,
+        )
+
+    def _infer(self, task: PolicyWorkerTask) -> PolicyWorkerResult:
+        policy = self._policy
+        if policy is None:
+            policy = self._policy_factory()
+            self._policy = policy
+
+        if isinstance(task, PolicyBootstrapTask):
+            if self._rtc_metadata is None:
+                self._rtc_metadata = validate_rtc_runtime_metadata(self._runtime, policy.get_server_metadata())
+            return self._rtc_metadata
+
+        if self._rtc_metadata is None:
+            raise RuntimeError("Policy RTC worker must be bootstrapped before inference.")
+        if isinstance(task, InitialInferenceTask):
+            chunk = _infer_policy_chunk(
+                policy,
+                task.obs,
+                task.images,
+                prompt=self._prompt,
+                policy_action_layout=self._policy_action_layout,
+                rtc=None,
+                return_model_actions=True,
+            )
+            return _action_plan_from_chunk(
+                chunk,
+                generation_tick=0,
+                rtc_metadata=self._rtc_metadata,
+            )
+        return _infer_rtc_action_plan(
+            policy,
+            task,
+            prompt=self._prompt,
+            policy_action_layout=self._policy_action_layout,
+            rtc_metadata=self._rtc_metadata,
+        )
+
+
+@contextlib.contextmanager
+def _robot_session_with_policy_cleanup(
+    robot_connection: contextlib.AbstractContextManager[object],
+    policy_worker: PolicyRTCWorker,
+    *,
+    wait_for_policy: Callable[[], bool],
+) -> Iterator[object]:
+    """Close robot transport before the policy worker can wait on a late RPC."""
+    with contextlib.ExitStack() as cleanup:
+        cleanup.callback(lambda: policy_worker.close(wait=wait_for_policy()))
+        robot_ws = cleanup.enter_context(robot_connection)
+        yield robot_ws
 
 
 def _current_command_state(
@@ -403,12 +526,21 @@ def main(args: BootstrapArgs) -> None:
         runtime.control.source_hz,
     )
 
-    policy = _websocket_client_policy.WebsocketClientPolicy(
-        host=runtime.policy.host,
-        port=runtime.policy.port,
+    policy_action_layout: Literal["joint", "cartesian"] = runtime.robot.action_layout  # type: ignore[assignment]
+    policy_worker = PolicyRTCWorker(
+        runtime=runtime,
+        prompt=runtime.policy.prompt,
+        policy_action_layout=policy_action_layout,
     )
-    policy_metadata = policy.get_server_metadata()
-    rtc_metadata = validate_rtc_runtime_metadata(runtime, policy_metadata)
+    try:
+        bootstrap_result = policy_worker.submit(PolicyBootstrapTask()).result().value
+    except Exception:
+        policy_worker.close()
+        raise
+    if not isinstance(bootstrap_result, RTCRuntimeMetadata):
+        policy_worker.close()
+        raise RuntimeError("Policy RTC worker returned an invalid bootstrap result.")
+    rtc_metadata = bootstrap_result
     logging.info(
         "Policy RTC capability: algorithm=training_time_v1 horizon=%d action_dim=%d training_max_delay_steps=%d",
         rtc_metadata.action_horizon,
@@ -416,8 +548,12 @@ def main(args: BootstrapArgs) -> None:
         rtc_metadata.training_max_delay_steps,
     )
 
-    policy_action_layout: Literal["joint", "cartesian"] = runtime.robot.action_layout  # type: ignore[assignment]
-    with websockets.sync.client.connect(runtime.robot.url, max_size=None, compression=None) as robot_ws:
+    flight: RTCInferenceFlight | None = None
+    with _robot_session_with_policy_cleanup(
+        websockets.sync.client.connect(runtime.robot.url, max_size=None, compression=None),
+        policy_worker,
+        wait_for_policy=lambda: flight is None or flight.future.done(),
+    ) as robot_ws:
         hello = spiritai_bridge.unpack_robot_server_message(robot_ws.recv())
         if hello.get("type") != "hello":
             raise spiritai_bridge.RobotServerProtocolError(
@@ -532,21 +668,13 @@ def main(args: BootstrapArgs) -> None:
                     )
 
         initial_inference_started_at = time.perf_counter()
-        initial_chunk = _infer_policy_chunk(
-            policy,
-            initial_obs,
-            initial_images,
-            prompt=runtime.policy.prompt,
-            policy_action_layout=policy_action_layout,
-            rtc=None,
-            return_model_actions=True,
+        initial_result = policy_worker.submit(InitialInferenceTask(obs=initial_obs, images=initial_images)).result()
+        logging.info(
+            "Initial worker policy inference latency: %.3fs", time.perf_counter() - initial_inference_started_at
         )
-        logging.info("Initial synchronous policy inference latency: %.3fs", time.perf_counter() - initial_inference_started_at)
-        initial_plan = _action_plan_from_chunk(
-            initial_chunk,
-            generation_tick=0,
-            rtc_metadata=rtc_metadata,
-        )
+        if not isinstance(initial_result.value, ActionPlan):
+            raise RuntimeError("Policy RTC worker returned an invalid initial action plan.")
+        initial_plan = initial_result.value
         controller = RTCController(
             action_horizon=rtc_metadata.action_horizon,
             action_dim=rtc_metadata.action_dim,
@@ -555,18 +683,6 @@ def main(args: BootstrapArgs) -> None:
         )
         controller.install_initial_plan(initial_plan)
 
-        def worker_infer(task: RTCInferenceTask) -> ActionPlan:
-            return infer_rtc_action_plan(
-                policy,
-                task,
-                prompt=runtime.policy.prompt,
-                policy_action_layout=policy_action_layout,
-                rtc_metadata=rtc_metadata,
-            )
-
-        worker = RTCInferenceWorker(worker_infer)
-        inflight_future: Future[RTCInferenceResult[ActionPlan]] | None = None
-        inflight_request: RTCRequest | None = None
         request_budget_blocked = False
         previous_state: np.ndarray | None = None
         accepted_command_history: deque[np.ndarray] = deque(maxlen=2)
@@ -608,44 +724,67 @@ def main(args: BootstrapArgs) -> None:
                         rolling_ack_duration_s,
                         rpc_budget_s,
                     )
-                    if inflight_request is not None:
+                    if flight is not None and not flight.expired:
                         request_budget_blocked = True
                 else:
                     consecutive_rpc_budget_misses = 0
                 logging.info("Tick %d read-only preflight latency: %.3fs", current_tick, read_only_duration_s)
 
-                if inflight_future is not None and inflight_future.done():
-                    if inflight_request is None:
-                        raise RuntimeError("RTC worker completed without a tracked request.")
-                    completed_future = inflight_future
-                    completed_request = inflight_request
-                    inflight_future = None
-                    inflight_request = None
-                    try:
-                        result = completed_future.result()
-                    except Exception:
-                        logging.exception("Tick %d RTC worker inference failed", current_tick)
-                        controller.record_failed_request(completed_request)
-                    else:
-                        logging.info(
-                            "Tick %d RTC worker inference latency: %.3fs",
-                            current_tick,
-                            result.finished_at - result.started_at,
-                        )
-                        if request_budget_blocked:
-                            logging.error(
-                                "Tick %d discarding RTC plan because its request crossed the RPC budget", current_tick
-                            )
-                            controller.record_failed_request(completed_request)
+                if flight is not None:
+                    if flight.future.done():
+                        completed_flight = flight
+                        flight = None
+                        try:
+                            result = completed_flight.completed_result()
+                        except Exception:
+                            if completed_flight.expired:
+                                logging.exception("Tick %d discarding failed expired RTC worker result", current_tick)
+                            else:
+                                logging.exception("Tick %d RTC worker inference failed", current_tick)
+                                controller.record_failed_request(completed_flight.request)
                         else:
-                            accepted = controller.accept_result(
-                                completed_request,
-                                result.value,
-                                completion_tick=current_tick,
-                            )
-                            if not accepted:
-                                logging.warning("Tick %d RTC plan missed its deadline and was not installed", current_tick)
-                    request_budget_blocked = False
+                            if result is None:
+                                logging.warning("Tick %d discarding expired RTC worker result", current_tick)
+                            else:
+                                logging.info(
+                                    "Tick %d RTC worker inference latency: %.3fs",
+                                    current_tick,
+                                    result.finished_at - result.started_at,
+                                )
+                                if request_budget_blocked:
+                                    logging.error(
+                                        "Tick %d discarding RTC plan because its request crossed the RPC budget",
+                                        current_tick,
+                                    )
+                                    controller.record_failed_request(completed_flight.request)
+                                else:
+                                    accepted = controller.accept_result(
+                                        completed_flight.request,
+                                        result.value,
+                                        completion_tick=current_tick,
+                                    )
+                                    if not accepted:
+                                        logging.warning(
+                                            "Tick %d RTC plan missed its deadline and was not installed", current_tick
+                                        )
+                        request_budget_blocked = False
+                    elif flight.expire_if_due(controller, current_tick=current_tick):
+                        request_budget_blocked = False
+                        logging.warning(
+                            "Tick %d RTC request=%d expired before worker completion",
+                            current_tick,
+                            flight.request.request_id,
+                        )
+                    elif flight.expired:
+                        # The sole executor still owns the policy WebSocket. A retry cannot begin
+                        # until this stale call returns; issuing one now would create a concurrent
+                        # policy query. Count the blocked tick so a hung worker reaches hold/stop.
+                        controller.record_worker_unavailable()
+                        logging.error(
+                            "Tick %d expired RTC request=%d still blocks the single policy worker",
+                            current_tick,
+                            flight.request.request_id,
+                        )
 
                 _raise_after_consecutive_deadline_misses(
                     count=consecutive_rpc_budget_misses,
@@ -659,24 +798,22 @@ def main(args: BootstrapArgs) -> None:
                 )
 
                 active_plan = controller.current_plan
-                request_tick = (
+                request_due = (
                     active_plan is not None
                     and current_tick
-                    == active_plan.generation_tick
-                    + max(runtime.rtc.delay.planned_max_steps, runtime.rtc.s_min)
+                    >= active_plan.generation_tick + max(runtime.rtc.delay.planned_max_steps, runtime.rtc.s_min)
+                    and current_tick + runtime.rtc.delay.planned_max_steps
+                    <= active_plan.generation_tick + rtc_metadata.action_horizon
                 )
-                if (
-                    not rpc_budget_exceeded
-                    and inflight_future is None
-                    and controller.inflight_request is None
-                    and request_tick
-                ):
+                if not rpc_budget_exceeded and flight is None and controller.inflight_request is None and request_due:
                     request = controller.start_request(
                         current_tick=current_tick,
                         planned_delay_steps=runtime.rtc.delay.planned_max_steps,
                     )
-                    inflight_request = request
-                    inflight_future = worker.submit(RTCInferenceTask(request=request, obs=obs, images=images))
+                    flight = RTCInferenceFlight(
+                        request=request,
+                        future=policy_worker.submit(RTCInferenceTask(request=request, obs=obs, images=images)),
+                    )
                     logging.info(
                         "Tick %d submitted RTC request=%d delay_steps=%d",
                         current_tick,
@@ -758,7 +895,7 @@ def main(args: BootstrapArgs) -> None:
                     ack_duration_s,
                 )
         finally:
-            worker.close()
+            logging.info("RTC control loop exiting; robot transport closes before policy worker cleanup.")
 
 
 if __name__ == "__main__":

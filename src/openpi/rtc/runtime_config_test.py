@@ -197,6 +197,16 @@ def test_parser_rejects_invalid_semantic_constraint(tmp_path: Path) -> None:
         load_runtime_config(path)
 
 
+def test_parser_rejects_zero_planned_delay_steps(tmp_path: Path) -> None:
+    runtime = copy.deepcopy(VALID_RUNTIME)
+    runtime["rtc"]["delay"]["planned_max_steps"] = 0
+    path = tmp_path / "bad.yaml"
+    write_runtime(path, runtime)
+
+    with pytest.raises(RuntimeConfigError, match="rtc.delay.planned_max_steps must be positive"):
+        load_runtime_config(path)
+
+
 @pytest.mark.parametrize("document", ["", "- not-a-mapping\n"])
 def test_parser_rejects_empty_or_nonmapping_document(tmp_path: Path, document: str) -> None:
     path = tmp_path / "bad.yaml"

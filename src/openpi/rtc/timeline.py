@@ -169,14 +169,18 @@ class RTCController:
             raise RTCStateError("cannot start an RTC request without an active action plan")
         if self.inflight_request is not None:
             raise RTCStateError("an RTC request is already in flight")
-        if current_tick != self.active_plan.generation_tick + s:
-            raise RTCStateError("current_tick must equal active_plan.generation_tick + execution_horizon")
+        first_request_tick = self.active_plan.generation_tick + s
+        if current_tick < first_request_tick:
+            raise RTCStateError("current_tick cannot be before the active plan request horizon")
         if planned_delay_steps > self.training_max_delay_steps:
             raise RTCStateError("planned_delay_steps is outside the training range")
-        if planned_delay_steps > self.action_horizon - s:
+        source_offset = current_tick - self.active_plan.generation_tick
+        if source_offset >= self.action_horizon:
+            raise RTCStateError("active action plan horizon is exhausted")
+        if source_offset + planned_delay_steps > self.action_horizon:
             raise RTCStateError("planned_delay_steps exceeds the remaining action horizon")
 
-        frozen_prefix = self.active_plan.model_actions[s : s + planned_delay_steps]
+        frozen_prefix = self.active_plan.model_actions[source_offset : source_offset + planned_delay_steps]
         action_prefix = np.zeros(
             (self.action_horizon, self.action_dim),
             dtype=self.active_plan.model_actions.dtype,
@@ -187,7 +191,7 @@ class RTCController:
             source_generation_tick=self.active_plan.generation_tick,
             start_tick=current_tick,
             planned_delay_steps=planned_delay_steps,
-            execution_horizon=s,
+            execution_horizon=source_offset,
             action_prefix=action_prefix,
             frozen_prefix=frozen_prefix,
         )
@@ -209,8 +213,7 @@ class RTCController:
         actual_delay = completion_tick - inflight_request.start_tick
         if actual_delay > inflight_request.planned_delay_steps:
             self.inflight_request = None
-            self.deadline_miss_count += 1
-            self.consecutive_deadline_misses += 1
+            self._record_deadline_miss()
             return False
         if result_plan.generation_tick != inflight_request.start_tick:
             raise RTCStateError("result_plan.generation_tick must equal request.start_tick")
@@ -228,8 +231,27 @@ class RTCController:
         if request.request_id != self.inflight_request.request_id:
             raise RTCStateError("stale or mismatched request cannot fail")
         self.inflight_request = None
-        self.deadline_miss_count += 1
-        self.consecutive_deadline_misses += 1
+        self._record_deadline_miss()
+
+    def expire_request(self, request: RTCRequest, *, current_tick: int) -> bool:
+        """Expire a request not observed complete by its training-time deadline."""
+        current_tick = _nonnegative_integer(current_tick, "current_tick")
+        if self.inflight_request is None:
+            raise RTCStateError("no RTC request is in flight")
+        inflight_request = self.inflight_request
+        if request.request_id != inflight_request.request_id:
+            raise RTCStateError("stale or mismatched request cannot expire")
+        if current_tick < inflight_request.start_tick + inflight_request.planned_delay_steps:
+            return False
+        self.inflight_request = None
+        self._record_deadline_miss()
+        return True
+
+    def record_worker_unavailable(self) -> None:
+        """Count an expired worker that still prevents a single-flight retry."""
+        if self.inflight_request is not None:
+            raise RTCStateError("cannot record worker unavailability while a request is in flight")
+        self._record_deadline_miss()
 
     def action_for_tick(self, tick: int) -> DispatchAction:
         """Return the current plan's action at ``tick``, or an explicit hold."""
@@ -259,3 +281,7 @@ class RTCController:
             raise RTCStateError("plan action_horizon does not match the controller")
         if plan.model_actions.shape[1] != self.action_dim:
             raise RTCStateError("plan action_dim does not match the controller")
+
+    def _record_deadline_miss(self) -> None:
+        self.deadline_miss_count += 1
+        self.consecutive_deadline_misses += 1

@@ -182,6 +182,24 @@ def test_failed_request_records_a_deadline_miss_and_keeps_the_old_plan():
     assert controller.consecutive_deadline_misses == 1
 
 
+def test_expired_request_releases_the_controller_for_a_current_plan_retry():
+    old_plan = make_plan(generation_tick=10)
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(old_plan)
+    request = controller.start_request(current_tick=11, planned_delay_steps=1)
+
+    assert controller.expire_request(request, current_tick=12) is True
+
+    assert controller.active_plan is old_plan
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 1
+    retry = controller.start_request(current_tick=12, planned_delay_steps=1)
+    assert retry.request_id == request.request_id + 1
+    assert retry.start_tick == 12
+    assert retry.execution_horizon == 2
+    np.testing.assert_array_equal(retry.frozen_prefix, old_plan.model_actions[2:3])
+
+
 def test_accept_result_rejects_completion_before_the_request_start_tick():
     old_plan = make_plan(generation_tick=10)
     controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)

@@ -35,6 +35,7 @@ class RTCInferenceWorker(Generic[RequestT, ValueT]):
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._future: Future[RTCInferenceResult[ValueT]] | None = None
         self._closed = False
+        self._nonblocking_shutdown = False
         self._close_complete = threading.Event()
         self._lock = threading.Lock()
         self._inference_thread: threading.Thread | None = None
@@ -49,22 +50,39 @@ class RTCInferenceWorker(Generic[RequestT, ValueT]):
             self._future = self._executor.submit(self._run, request)
             return self._future
 
-    def close(self) -> None:
-        """Wait for submitted inference to finish and release the worker thread."""
+    def close(self, *, wait: bool = True) -> None:
+        """Close the worker, optionally returning while one inference finishes."""
         if threading.current_thread() is self._inference_thread:
             raise RuntimeError("RTC inference worker cannot be closed from its own inference thread")
         with self._lock:
             if self._closed:
                 should_shutdown = False
+                should_complete_nonblocking_shutdown = wait and self._nonblocking_shutdown
+                if should_complete_nonblocking_shutdown:
+                    self._nonblocking_shutdown = False
             else:
                 self._closed = True
                 should_shutdown = True
+                should_complete_nonblocking_shutdown = False
+                self._nonblocking_shutdown = not wait
         if should_shutdown:
+            try:
+                self._executor.shutdown(wait=wait, cancel_futures=False)
+            finally:
+                if wait:
+                    self._close_complete.set()
+                else:
+                    future = self._future
+                    if future is None:
+                        self._close_complete.set()
+                    else:
+                        future.add_done_callback(lambda _future: self._close_complete.set())
+        elif should_complete_nonblocking_shutdown:
             try:
                 self._executor.shutdown(wait=True, cancel_futures=False)
             finally:
                 self._close_complete.set()
-        else:
+        elif wait:
             self._close_complete.wait()
 
     def _run(self, request: RequestT) -> RTCInferenceResult[ValueT]:

@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import dataclasses
 import importlib.util
+import inspect
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
 import numpy as np
 import pytest
 
+from openpi.rtc import ActionPlan
+from openpi.rtc import RTCController
 from openpi.rtc import RTCRequest
+from openpi.rtc.worker import RTCInferenceResult
 
 MAIN_PATH = Path(__file__).with_name("main.py")
 
@@ -119,7 +125,7 @@ def test_validate_rtc_runtime_metadata_rejects_incompatible_capabilities(runtime
         main.validate_rtc_runtime_metadata(runtime, metadata)
 
 
-def test_worker_inference_sends_the_training_time_envelope_and_builds_start_tick_plan():
+def test_policy_worker_owns_connection_metadata_and_all_inference_calls():
     main = load_main_module()
     obs, images = make_joint_observation()
     action_prefix = np.zeros((4, 2), dtype=np.float32)
@@ -134,11 +140,21 @@ def test_worker_inference_sends_the_training_time_envelope_and_builds_start_tick
         frozen_prefix=action_prefix[:2],
     )
 
+    main_thread_id = threading.get_ident()
+    factory_thread_ids = []
+    metadata_thread_ids = []
+    inference_thread_ids = []
+
     class FakePolicy:
         def __init__(self):
             self.calls = []
 
+        def get_server_metadata(self):
+            metadata_thread_ids.append(threading.get_ident())
+            return make_policy_metadata()
+
         def infer(self, policy_obs, *, rtc, return_model_actions):
+            inference_thread_ids.append(threading.get_ident())
             self.calls.append((policy_obs, rtc, return_model_actions))
             return {
                 "actions": np.full((4, 27), 5.0, dtype=np.float32),
@@ -146,19 +162,29 @@ def test_worker_inference_sends_the_training_time_envelope_and_builds_start_tick
             }
 
     policy = FakePolicy()
-    task = main.RTCInferenceTask(request=request, obs=obs, images=images)
-    metadata = main.RTCRuntimeMetadata(action_horizon=4, action_dim=2, training_max_delay_steps=2)
 
-    plan = main.infer_rtc_action_plan(
-        policy,
-        task,
+    def policy_factory():
+        factory_thread_ids.append(threading.get_ident())
+        return policy
+
+    policy_worker = main.PolicyRTCWorker(
+        runtime=make_runtime(),
         prompt="fold the paper box",
         policy_action_layout="joint",
-        rtc_metadata=metadata,
+        policy_factory=policy_factory,
     )
+    try:
+        rtc_metadata = policy_worker.submit(main.PolicyBootstrapTask()).result().value
+        initial_plan = policy_worker.submit(main.InitialInferenceTask(obs=obs, images=images)).result().value
+        plan = policy_worker.submit(main.RTCInferenceTask(request=request, obs=obs, images=images)).result().value
+    finally:
+        policy_worker.close()
 
-    assert len(policy.calls) == 1
-    policy_obs, rtc, return_model_actions = policy.calls[0]
+    assert isinstance(rtc_metadata, main.RTCRuntimeMetadata)
+    assert isinstance(initial_plan, ActionPlan)
+    assert isinstance(plan, ActionPlan)
+    assert len(policy.calls) == 2
+    policy_obs, rtc, return_model_actions = policy.calls[1]
     assert policy_obs["prompt"] == "fold the paper box"
     assert rtc["algorithm"] == "training_time_v1"
     np.testing.assert_array_equal(rtc["action_prefix"], action_prefix)
@@ -167,6 +193,114 @@ def test_worker_inference_sends_the_training_time_envelope_and_builds_start_tick
     assert plan.generation_tick == request.start_tick
     assert plan.model_actions.shape == (4, 2)
     assert plan.robot_actions.shape == (4, 27)
+    assert len(metadata_thread_ids) == 1
+    assert len(factory_thread_ids) == 1
+    assert set(factory_thread_ids + metadata_thread_ids + inference_thread_ids).isdisjoint({main_thread_id})
+    assert len(set(factory_thread_ids + metadata_thread_ids + inference_thread_ids)) == 1
+
+
+def test_main_delegates_all_policy_ownership_to_policy_rtc_worker():
+    main = load_main_module()
+    main_source = inspect.getsource(main.main)
+
+    assert "PolicyRTCWorker(" in main_source
+    assert "WebsocketClientPolicy(" not in main_source
+    assert ".get_server_metadata(" not in main_source
+    assert "_infer_policy_chunk(" not in main_source
+
+
+def test_expired_slow_worker_result_is_discarded_and_the_active_plan_can_retry():
+    main = load_main_module()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    original_plan = ActionPlan(
+        generation_tick=0,
+        model_actions=np.arange(16, dtype=np.float32).reshape(8, 2),
+        robot_actions=np.zeros((8, 3), dtype=np.float32),
+    )
+    controller.install_initial_plan(original_plan)
+    request = controller.start_request(current_tick=1, planned_delay_steps=1)
+    future = Future()
+    flight = main.RTCInferenceFlight(request=request, future=future)
+
+    assert flight.expire_if_due(controller, current_tick=1) is False
+    assert flight.expire_if_due(controller, current_tick=2) is True
+    assert flight.expired is True
+    assert controller.current_plan is original_plan
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 1
+
+    future.set_result(
+        RTCInferenceResult(
+            value=ActionPlan(
+                generation_tick=1,
+                model_actions=np.full((8, 2), 99.0, dtype=np.float32),
+                robot_actions=np.full((8, 3), 99.0, dtype=np.float32),
+            ),
+            started_at=1.0,
+            finished_at=2.0,
+        )
+    )
+    assert flight.completed_result() is None
+    assert controller.current_plan is original_plan
+
+    retry = controller.start_request(current_tick=2, planned_delay_steps=1)
+    assert retry.request_id == 1
+    assert retry.start_tick == 2
+    np.testing.assert_array_equal(retry.frozen_prefix, original_plan.model_actions[2:3])
+
+
+def test_never_completing_worker_is_expired_and_counts_toward_stop_budget():
+    main = load_main_module()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(
+        ActionPlan(
+            generation_tick=0,
+            model_actions=np.zeros((8, 2), dtype=np.float32),
+            robot_actions=np.zeros((8, 3), dtype=np.float32),
+        )
+    )
+    request = controller.start_request(current_tick=1, planned_delay_steps=1)
+    future = Future()
+    flight = main.RTCInferenceFlight(request=request, future=future)
+
+    assert flight.expire_if_due(controller, current_tick=2) is True
+    assert future.done() is False
+    controller.record_worker_unavailable()
+
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 2
+    assert controller.consecutive_deadline_misses == 2
+
+
+def test_robot_session_closes_robot_before_abandoning_a_hung_policy_worker():
+    main = load_main_module()
+    events = []
+
+    class FakePolicyWorker:
+        def close(self, *, wait=True):
+            events.append(("policy_close", wait))
+
+    class FakeRobotConnection:
+        def __enter__(self):
+            events.append(("robot_enter", None))
+            return object()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("robot_exit", None))
+
+    with main._robot_session_with_policy_cleanup(  # noqa: SLF001
+        FakeRobotConnection(),
+        FakePolicyWorker(),
+        wait_for_policy=lambda: False,
+    ):
+        events.append(("loop_stop", None))
+
+    assert events == [
+        ("robot_enter", None),
+        ("loop_stop", None),
+        ("robot_exit", None),
+        ("policy_close", False),
+    ]
 
 
 def test_bootstrap_args_is_a_frozen_dataclass():

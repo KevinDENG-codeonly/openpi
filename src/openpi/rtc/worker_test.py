@@ -115,6 +115,32 @@ def test_close_waits_rejects_later_submits_and_is_idempotent():
         worker.submit("later")
 
 
+def test_nonblocking_close_releases_the_caller_while_inference_finishes_later():
+    started = threading.Event()
+    allow_finish = threading.Event()
+
+    def infer(request: str) -> str:
+        started.set()
+        assert allow_finish.wait(timeout=1)
+        return request.upper()
+
+    worker = RTCInferenceWorker(infer)
+    future = worker.submit("slow")
+    assert started.wait(timeout=1)
+
+    try:
+        worker.close(wait=False)
+
+        assert not future.done()
+        with pytest.raises(RuntimeError, match="closed"):
+            worker.submit("later")
+    finally:
+        allow_finish.set()
+        worker.close()
+
+    assert future.result(timeout=1).value == "SLOW"
+
+
 def test_close_from_its_own_inference_thread_is_rejected_without_closing():
     shutdown_callers: list[threading.Thread] = []
 

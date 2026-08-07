@@ -300,7 +300,7 @@ def _parse_delay(value: Any) -> RTCDelayRuntimeConfig:
     mapping = _require_mapping(value, "rtc.delay")
     _require_exact_keys(mapping, {"planned_max_steps", "history_window", "safety_margin_steps"}, "rtc.delay")
     return RTCDelayRuntimeConfig(
-        planned_max_steps=_require_nonnegative_integer(mapping["planned_max_steps"], "rtc.delay.planned_max_steps"),
+        planned_max_steps=_require_positive_integer(mapping["planned_max_steps"], "rtc.delay.planned_max_steps"),
         history_window=_require_nonnegative_integer(mapping["history_window"], "rtc.delay.history_window"),
         safety_margin_steps=_require_nonnegative_integer(
             mapping["safety_margin_steps"], "rtc.delay.safety_margin_steps"
