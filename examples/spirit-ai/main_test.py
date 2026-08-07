@@ -336,14 +336,35 @@ def test_robot_write_deadline_requires_a_usable_socket():
         main._install_total_write_deadline(object(), timeout_s=0.25)  # noqa: SLF001
 
 
-def test_robot_connection_write_timeout_failure_closes_the_transport(monkeypatch):
+def test_robot_write_deadline_rejects_tls_socket(monkeypatch):
     main = load_main_module()
 
-    class UnusableSocket:
-        pass
+    class FakeTLSSocket:
+        def send(self, data, flags):
+            raise AssertionError("TLS socket must not be wrapped for MSG_DONTWAIT sends")
 
     class FakeConnection:
-        socket = UnusableSocket()
+        def __init__(self):
+            self.socket = FakeTLSSocket()
+
+    monkeypatch.setattr(main, "ssl", SimpleNamespace(SSLSocket=FakeTLSSocket), raising=False)
+    connection = FakeConnection()
+
+    with pytest.raises(RuntimeError, match="non-TLS ws://"):
+        main._install_total_write_deadline(connection, timeout_s=0.25)  # noqa: SLF001
+
+    assert isinstance(connection.socket, FakeTLSSocket)
+
+
+def test_robot_tls_write_deadline_setup_failure_closes_the_transport(monkeypatch):
+    main = load_main_module()
+
+    class FakeTLSSocket:
+        def send(self, data, flags):
+            raise AssertionError("TLS socket must not be wrapped for MSG_DONTWAIT sends")
+
+    class FakeConnection:
+        socket = FakeTLSSocket()
 
         def __init__(self):
             self.close_calls = 0
@@ -352,9 +373,10 @@ def test_robot_connection_write_timeout_failure_closes_the_transport(monkeypatch
             self.close_calls += 1
 
     connection = FakeConnection()
+    monkeypatch.setattr(main, "ssl", SimpleNamespace(SSLSocket=FakeTLSSocket))
     monkeypatch.setattr(main.websockets.sync.client, "connect", lambda *args, **kwargs: connection)
 
-    with pytest.raises(RuntimeError, match="total write deadline"):
+    with pytest.raises(RuntimeError, match="non-TLS ws://"):
         main._open_robot_connection("ws://robot", timeout_s=0.25)  # noqa: SLF001
 
     assert connection.close_calls == 1
@@ -422,6 +444,57 @@ def test_robot_write_deadline_proxy_does_not_reset_its_deadline_after_partial_wr
     proxy.close()
     assert raw_socket.shutdown_calls == [socket.SHUT_RDWR]
     assert raw_socket.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("robot_url", "policy_host"),
+    [
+        ("wss://robot", "localhost"),
+        ("ws://robot", "wss://policy"),
+    ],
+)
+def test_training_time_rtc_transport_validation_rejects_wss(robot_url, policy_host):
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url=robot_url),
+        policy=SimpleNamespace(host=policy_host),
+    )
+
+    with pytest.raises(RuntimeError, match="requires ws://"):
+        main._validate_training_time_rtc_transport_safety(runtime)  # noqa: SLF001
+
+
+def test_training_time_rtc_transport_validation_accepts_ws_and_unschemed_policy_host():
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url="ws://robot"),
+        policy=SimpleNamespace(host="localhost"),
+    )
+
+    assert main._validate_training_time_rtc_transport_safety(runtime) is None  # noqa: SLF001
+
+
+def test_main_rejects_wss_before_creating_the_policy_worker(monkeypatch):
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url="wss://robot", action_layout="joint"),
+        policy=SimpleNamespace(host="localhost"),
+        rtc=SimpleNamespace(mode="training_time"),
+        control=SimpleNamespace(source_hz=15.0),
+    )
+    policy_worker_created = []
+
+    monkeypatch.setattr(main, "load_runtime_config", lambda _path: runtime)
+    monkeypatch.setattr(
+        main,
+        "PolicyRTCWorker",
+        lambda **_kwargs: policy_worker_created.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="requires ws://"):
+        main.main(main.BootstrapArgs())
+
+    assert policy_worker_created == []
 
 
 def test_robot_write_deadline_proxy_rejects_a_zero_byte_write(monkeypatch):

@@ -4,6 +4,7 @@ import numbers
 import errno
 import select
 import socket
+import ssl
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -71,6 +72,11 @@ def _install_total_write_deadline(
 ) -> None:
     """Install a Linux total-deadline send proxy before the first application write."""
     raw_socket = getattr(connection, "socket", None)
+    if isinstance(raw_socket, ssl.SSLSocket):
+        raise RuntimeError(
+            "Finite total websocket write deadlines require non-TLS ws:// because "
+            "Python SSLSocket does not support per-send MSG_DONTWAIT."
+        )
     if not callable(getattr(raw_socket, "send", None)):
         raise RuntimeError("Websocket connection does not expose a usable socket for total write deadline.")
     connection.socket = _SocketWriteDeadlineProxy(raw_socket, timeout_s=timeout_s)

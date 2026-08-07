@@ -2,6 +2,7 @@
 
 import threading
 import socket
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,6 +90,72 @@ def test_explicit_connect_timeout_fails_when_write_timeout_cannot_be_configured(
         websocket_client_policy.WebsocketClientPolicy(connect_timeout_s=0.25)
 
     assert connection.close_calls == 1
+
+
+def test_finite_connect_timeout_rejects_tls_socket_before_any_inference_write(monkeypatch):
+    class FakeTLSSocket:
+        def send(self, data, flags):
+            raise AssertionError("TLS socket must not be wrapped for MSG_DONTWAIT sends")
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FakeTLSSocket()
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        websocket_client_policy,
+        "ssl",
+        SimpleNamespace(SSLSocket=FakeTLSSocket),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        websocket_client_policy.websockets.sync.client,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(RuntimeError, match="non-TLS ws://"):
+        websocket_client_policy.WebsocketClientPolicy(host="wss://policy", connect_timeout_s=0.25)
+
+    assert connection.close_calls == 1
+
+
+def test_wss_without_finite_connect_timeout_preserves_existing_policy_behavior(monkeypatch):
+    class FakeTLSSocket:
+        pass
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FakeTLSSocket()
+
+        def recv(self, *, timeout):
+            return b"metadata"
+
+        def close(self):
+            pass
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        websocket_client_policy,
+        "ssl",
+        SimpleNamespace(SSLSocket=FakeTLSSocket),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        websocket_client_policy.websockets.sync.client,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+    monkeypatch.setattr(websocket_client_policy.msgpack_numpy, "unpackb", lambda _value: {"name": "fake"})
+
+    policy = websocket_client_policy.WebsocketClientPolicy(host="wss://policy")
+    policy.close()
+
+    assert isinstance(connection.socket, FakeTLSSocket)
 
 
 def test_policy_write_deadline_proxy_does_not_reset_its_deadline_after_partial_writes(monkeypatch):

@@ -1,4 +1,5 @@
 schema_version: 1
+# Training-time RTC total write-deadline safety currently requires non-TLS ws:// endpoints.
 policy: {host: localhost, port: 8000, prompt: fold the paper box, connect_timeout_s: 1.0}
 robot:
   url: ws://172.16.0.30:8766

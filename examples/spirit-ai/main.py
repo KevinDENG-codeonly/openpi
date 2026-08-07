@@ -15,6 +15,7 @@ import numbers
 from pathlib import Path
 import select
 import socket
+import ssl
 import threading
 import time
 from typing import Literal
@@ -224,6 +225,11 @@ def _install_total_write_deadline(
 ) -> None:
     """Install a Linux total-deadline send proxy before the first application write."""
     raw_socket = getattr(connection, "socket", None)
+    if isinstance(raw_socket, ssl.SSLSocket):
+        raise RuntimeError(
+            "Finite total websocket write deadlines require non-TLS ws:// because "
+            "Python SSLSocket does not support per-send MSG_DONTWAIT."
+        )
     if not callable(getattr(raw_socket, "send", None)):
         raise RuntimeError("Websocket connection does not expose a usable socket for total write deadline.")
     connection.socket = _SocketWriteDeadlineProxy(raw_socket, timeout_s=timeout_s)
@@ -729,9 +735,19 @@ def _dispatch_for_stop_or_plan(
     return controller.action_for_tick(current_tick), None
 
 
+def _validate_training_time_rtc_transport_safety(runtime: RuntimeConfig) -> None:
+    """Reject TLS endpoints because total-deadline sends require Linux ``MSG_DONTWAIT``."""
+    if runtime.robot.url.lower().startswith("wss://") or runtime.policy.host.lower().startswith("wss://"):
+        raise RuntimeError(
+            "Training-time RTC transport safety requires ws:// endpoints, not wss://, "
+            "because finite total write deadlines need per-send Linux MSG_DONTWAIT."
+        )
+
+
 def main(args: BootstrapArgs) -> None:
     config_path = args.config.expanduser().resolve()
     runtime = load_runtime_config(config_path)
+    _validate_training_time_rtc_transport_safety(runtime)
     logging.info(
         "RTC runtime config: path=%s robot_url=%s action_layout=%s rtc_mode=%s source_hz=%.3f",
         config_path,
