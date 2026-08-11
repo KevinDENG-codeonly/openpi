@@ -69,6 +69,55 @@ Assemble the cardboard box by erecting the flat sheet and folding the side flaps
 
 This keeps deployment aligned with a global prompt such as `fold the box`, while giving training extra local supervision from subtask annotations.
 
+## Add a Reviewed Global-Prompt Episode Sample
+
+For the corrected FoldBox dataset, the original episodes already contain the hierarchical
+`global prompt + Current step:` task IDs. The augmentation workflow keeps those rows unchanged
+and appends a random sample of complete episodes whose Parquet rows use the pure global prompt at
+task index `39`. It does not slice or re-encode videos. The output is a standalone physical copy;
+files are copied with `shutil.copy2`, so the source and output can be moved or deleted independently.
+
+First generate a reproducible review manifest. The planner draws many candidates, each containing
+about 25% of the source episodes, and selects a candidate whose duplicated-frame ratio is close to
+25%. Recovery coverage is recorded for audit only; it is not a hard quota.
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py plan-global-prompt-augmentation \
+    --dataset-dir /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_10Annotations \
+    --manifest-path /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations.global_prompt_sampling.json \
+    --global-task-index 39 \
+    --duplicate-episode-fraction 0.25 \
+    --candidate-count 1000 \
+    --seed 20260811
+```
+
+Review the selected episode IDs, source fingerprints, duplicate-frame ratio, final global-prompt
+share, and recovery counts in the manifest before copying any data. Then build from that exact
+manifest; this command never samples again:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py augment-global-prompts \
+    --dataset-dir /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_10Annotations \
+    --output-dir /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations \
+    --selection-manifest /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations.global_prompt_sampling.json \
+    --overwrite
+```
+
+The build corrects `meta/info.json.total_tasks` to `40`, appends duplicate episodes after the
+original episode range, regenerates the local metadata and file manifest, and writes an audit copy
+to `meta/global_prompt_augmentation_manifest.json`. Validate the result before training:
+
+```bash
+uv run python examples/spirit-ai/dataset_transform.py validate-global-prompt-augmentation \
+    --dataset-dir /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations \
+    --selection-manifest /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations.global_prompt_sampling.json \
+    --action-horizon 10
+
+uv run python examples/spirit-ai/dataset_transform.py verify-video-sync \
+    --dataset-dir /home/deng/Documents/dataset/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations \
+    --strict-frame-count
+```
+
 ## Video Modes
 
 `--video_mode link-full` is the default. For subtask episodes, it links the original full video and keeps source timestamps, so video frame lookup still points to the original recording time.

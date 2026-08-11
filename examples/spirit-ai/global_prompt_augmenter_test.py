@@ -38,7 +38,7 @@ def write_episode(root: Path, info: dict, episode_index: int, task_indices: list
         {
             "episode_index": pa.array([episode_index] * length, type=pa.int64()),
             "frame_index": pa.array(range(length), type=pa.int64()),
-            "index": pa.array(range(episode_index * 10, episode_index * 10 + length), type=pa.int64()),
+            "index": pa.array(range(episode_index * 3, episode_index * 3 + length), type=pa.int64()),
             "task_index": pa.array(task_indices, type=pa.int64()),
             "timestamp": pa.array([step / 30 for step in range(length)], type=pa.float64()),
         }
@@ -130,6 +130,24 @@ def load_dataset_transform_module():
     return module
 
 
+def build_fixture_dataset(synthetic_dataset: Path, tmp_path: Path) -> tuple[Path, augmenter.GlobalPromptAugmentationPlan]:
+    plan = augmenter.plan_global_prompt_augmentation(
+        dataset_dir=synthetic_dataset,
+        global_task_index=39,
+        duplicate_episode_fraction=0.25,
+        candidate_count=50,
+        seed=20260811,
+    )
+    output_dir = tmp_path / "augmented"
+    augmenter.build_global_prompt_augmented_dataset(
+        dataset_dir=synthetic_dataset,
+        output_dir=output_dir,
+        plan=plan,
+        overwrite=False,
+    )
+    return output_dir, plan
+
+
 def test_plan_selects_exact_episode_count_and_is_reproducible(synthetic_dataset: Path):
     first = augmenter.plan_global_prompt_augmentation(
         dataset_dir=synthetic_dataset,
@@ -164,3 +182,121 @@ def test_plan_rejects_missing_global_task(synthetic_dataset: Path):
             candidate_count=10,
             seed=1,
         )
+
+
+def test_build_copies_source_and_appends_global_prompt_duplicates(synthetic_dataset: Path, tmp_path: Path):
+    output_dir, plan = build_fixture_dataset(synthetic_dataset, tmp_path)
+
+    assert len(lerobot_io.read_jsonl(output_dir / "meta" / "episodes.jsonl")) == 10
+    assert lerobot_io.read_json(output_dir / "meta" / "info.json")["total_tasks"] == 40
+
+    source_path = synthetic_dataset / "data/chunk-000/episode_000000.parquet"
+    output_path = output_dir / "data/chunk-000/episode_000000.parquet"
+    assert output_path.read_bytes() == source_path.read_bytes()
+    assert output_path.stat().st_ino != source_path.stat().st_ino
+
+    duplicate_episode_index = 8
+    duplicate_path = output_dir / lerobot_io.format_data_path(
+        lerobot_io.read_json(output_dir / "meta" / "info.json"), duplicate_episode_index
+    )
+    duplicate = pq.read_table(duplicate_path)
+    assert set(duplicate["task_index"].to_pylist()) == {39}
+    assert set(duplicate["episode_index"].to_pylist()) == {duplicate_episode_index}
+    assert plan.selected_duplicate_frames == duplicate.num_rows * len(plan.selected_episode_indices)
+
+
+def test_build_rejects_stale_plan(synthetic_dataset: Path, tmp_path: Path):
+    plan = augmenter.plan_global_prompt_augmentation(
+        dataset_dir=synthetic_dataset,
+        global_task_index=39,
+        duplicate_episode_fraction=0.25,
+        candidate_count=10,
+        seed=1,
+    )
+    tasks_path = synthetic_dataset / "meta" / "tasks.jsonl"
+    tasks = lerobot_io.read_jsonl(tasks_path)
+    tasks[39]["task"] = "changed global prompt"
+    write_jsonl(tasks_path, tasks)
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        augmenter.build_global_prompt_augmented_dataset(
+            dataset_dir=synthetic_dataset,
+            output_dir=tmp_path / "augmented",
+            plan=plan,
+            overwrite=False,
+        )
+
+
+def test_validate_rejects_duplicate_episode_with_non_global_task(synthetic_dataset: Path, tmp_path: Path):
+    output_dir, plan = build_fixture_dataset(synthetic_dataset, tmp_path)
+    rewrite_task_index(output_dir, episode_index=8, task_index=1)
+
+    with pytest.raises(ValueError, match="expected only task_index=39"):
+        augmenter.validate_global_prompt_augmented_dataset(
+            dataset_dir=output_dir,
+            plan=plan,
+            action_horizon=10,
+        )
+
+
+def test_validate_accepts_physical_copy_and_reports_prompt_distribution(synthetic_dataset: Path, tmp_path: Path):
+    output_dir, plan = build_fixture_dataset(synthetic_dataset, tmp_path)
+
+    report = augmenter.validate_global_prompt_augmented_dataset(
+        dataset_dir=output_dir,
+        plan=plan,
+        action_horizon=2,
+    )
+
+    assert report.total_episodes == 10
+    assert report.total_frames == 30
+    assert report.duplicate_episodes == 2
+    assert report.duplicate_frames == 6
+    assert report.global_prompt_frame_ratio == pytest.approx(0.2)
+    assert report.task_index_counts[39] == 6
+    assert report.action_horizon_checked_frames == 16
+    assert report.action_horizon_crossing_frames == 1
+
+
+def test_cli_exposes_plan_build_and_validate_commands():
+    module = load_dataset_transform_module()
+    parser = module.build_parser()
+
+    assert (
+        parser.parse_args(
+            [
+                "plan-global-prompt-augmentation",
+                "--dataset-dir",
+                "/tmp/source",
+                "--manifest-path",
+                "/tmp/plan.json",
+            ]
+        ).command
+        == "plan-global-prompt-augmentation"
+    )
+    assert (
+        parser.parse_args(
+            [
+                "augment-global-prompts",
+                "--dataset-dir",
+                "/tmp/source",
+                "--output-dir",
+                "/tmp/output",
+                "--selection-manifest",
+                "/tmp/plan.json",
+            ]
+        ).command
+        == "augment-global-prompts"
+    )
+    assert (
+        parser.parse_args(
+            [
+                "validate-global-prompt-augmentation",
+                "--dataset-dir",
+                "/tmp/output",
+                "--selection-manifest",
+                "/tmp/plan.json",
+            ]
+        ).command
+        == "validate-global-prompt-augmentation"
+    )
