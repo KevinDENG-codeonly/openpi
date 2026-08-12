@@ -37,3 +37,11 @@ def test_pi05_spiritai_cart_lora_h50_multiscale_rtc_config():
     assert config.model.pi05 is True
     assert config.model.action_horizon == 50
     assert config.rtc_training == _config.RTCTrainingConfig(enabled=True, max_delay_steps=12)
+
+
+def test_pi05_spiritai_cart_lora_h50_20260805_14annotations_rtc_config():
+    config = _config.get_config("pi05_spiritai_cart_lora_h50_20260805_14annotations")
+
+    assert config.model.pi05 is True
+    assert config.model.action_horizon == 50
+    assert config.rtc_training == _config.RTCTrainingConfig(enabled=True, max_delay_steps=20)

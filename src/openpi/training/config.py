@@ -1111,6 +1111,42 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi05_spiritai_cart_lora_h50_20260805_14annotations",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSpiritaiCartesianDataConfig(
+            repo_id="spiritai/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_500,
+            peak_lr=2e-5,
+            decay_steps=90_000,
+            decay_lr=2e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=90_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        log_interval=100,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        rtc_training=RTCTrainingConfig(enabled=True, max_delay_steps=20),
+    ),
+    TrainConfig(
         name="pi05_spiritai_cart_lora_h30",
         model=pi0_config.Pi0Config(
             pi05=True,

@@ -8,10 +8,10 @@ robot:
   initial_gripper_obs_state: 0.0965
   gripper_initial_tolerance: 0.00965
   gripper_reset_command_state: 1.0
-  gripper_reset_steps: 10
+  gripper_reset_steps: 20
 control:
-  source_hz: 15.0
-  max_steps: 2000
+  source_hz: 30.0
+  max_steps: 4000
   busy_sleep_s: 0.01
   startup_delay_s: 10.0
   blend_steps: 4
@@ -34,7 +34,7 @@ control:
     max_cart_accel: 0.0
 rtc:
   mode: training_time
-  s_min: 5
+  s_min: 10
   initial_inference_timeout_s: 10.0
-  delay: {planned_max_steps: 12, history_window: 16, safety_margin_steps: 1}
+  delay: {planned_max_steps: 15, history_window: 32, safety_margin_steps: 1}
   deadline_miss: {max_consecutive: 2, action: hold_then_stop}

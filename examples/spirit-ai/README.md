@@ -197,8 +197,9 @@ Known Spirit AI configs live in [`src/openpi/training/config.py`](../../src/open
 | `pi05_spiritai_cart_lora_h30_20260512_mixed` | Cartesian 25D | 30 | 20260512 mixed no-slice dataset |
 | `pi05_spiritai_cart_lora_h50_multiscale` | Cartesian 25D | 50 | 20260512 multiscale global/subtask dataset |
 | `pi05_spiritai_cart_lora_h50_multiscale_rtc` | Cartesian model 32D / robot 25D | 50 | Training-time RTC fine-tuning |
+| `pi05_spiritai_cart_lora_h50_20260805_14annotations` | Cartesian model 32D / robot 25D | 50 | 20260805 FoldBox 14-annotation, 30 Hz RTC fine-tuning |
 
-All listed pi0.5 LoRA configs load the pi0.5 base checkpoint, train LoRA adapters on the VLM/action expert, freeze non-LoRA weights, and use `ema_decay=None`. The `_rtc` config additionally sets:
+All listed pi0.5 LoRA configs load the pi0.5 base checkpoint, train LoRA adapters on the VLM/action expert, freeze non-LoRA weights, and use `ema_decay=None`. RTC-enabled configs additionally set `rtc_training`; for example, the legacy multiscale RTC config uses:
 
 ```python
 rtc_training=RTCTrainingConfig(enabled=True, max_delay_steps=12)
@@ -363,12 +364,14 @@ uv run python scripts/train.py pi05_spiritai_cart_lora_h50_multiscale_rtc \
     --ema-decay None
 ```
 
-`max_delay_steps=12` is compiled into this named training config. The deployment
-profile must use a compatible value, currently
-`rtc.delay.planned_max_steps: 12` in
-`examples/spirit-ai/configs/rtc/training_time.yaml`. If latency profiling leads to
-a different delay, update both the training config and the deployment YAML before
-starting a new fine-tuning run; do not change only the inference-side value.
+`max_delay_steps=12` is compiled into this legacy named training config. The
+checked-in 30 Hz `examples/spirit-ai/configs/rtc/training_time.yaml` profile uses
+`rtc.delay.planned_max_steps: 15`, which is compatible with
+`pi05_spiritai_cart_lora_h50_20260805_14annotations` (`max_delay_steps=20`) but
+not with the legacy 12-step checkpoint. Each checkpoint must use a deployment
+profile whose `planned_max_steps` does not exceed its trained maximum. If latency
+profiling requires a larger value, update the training config and deployment YAML
+together before starting a new fine-tuning run.
 
 Resume the same experiment only when a finalized checkpoint exists:
 

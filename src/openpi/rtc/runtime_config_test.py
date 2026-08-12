@@ -280,7 +280,7 @@ def test_parser_rejects_empty_or_nonmapping_document(tmp_path: Path, document: s
         load_runtime_config(path)
 
 
-def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None:
+def test_checked_in_default_profile_loads_with_30hz_rtc_defaults() -> None:
     profile = Path(__file__).resolve().parents[3] / "examples" / "spirit-ai" / "configs" / "rtc" / "training_time.yaml"
 
     cfg = load_runtime_config(profile)
@@ -300,7 +300,7 @@ def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None
         cfg.robot.gripper_initial_tolerance,
         cfg.robot.gripper_reset_command_state,
         cfg.robot.gripper_reset_steps,
-    ) == ("ws://172.16.0.30:8766", "cartesian", False, 0.0965, 0.00965, 1.0, 10)
+    ) == ("ws://172.16.0.30:8766", "cartesian", False, 0.0965, 0.00965, 1.0, 20)
     assert (
         cfg.control.source_hz,
         cfg.control.max_steps,
@@ -312,8 +312,8 @@ def test_checked_in_default_profile_loads_with_former_runtime_defaults() -> None
         cfg.control.rpc_budget_fraction,
         cfg.control.command_ack_timeout_s,
         cfg.control.robot_idle_timeout_s,
-    ) == (15.0, 2000, 0.01, 10.0, 4, 4, 0.2, 0.7, 1.0, 10.0)
+    ) == (30.0, 4000, 0.01, 10.0, 4, 4, 0.2, 0.7, 1.0, 10.0)
     assert dataclasses.asdict(cfg.control.motion_limits) == VALID_RUNTIME["control"]["motion_limits"]
-    assert (cfg.rtc.mode, cfg.rtc.s_min, cfg.rtc.initial_inference_timeout_s) == ("training_time", 5, 10.0)
-    assert dataclasses.asdict(cfg.rtc.delay) == {"planned_max_steps": 12, "history_window": 16, "safety_margin_steps": 1}
+    assert (cfg.rtc.mode, cfg.rtc.s_min, cfg.rtc.initial_inference_timeout_s) == ("training_time", 10, 10.0)
+    assert dataclasses.asdict(cfg.rtc.delay) == {"planned_max_steps": 15, "history_window": 32, "safety_margin_steps": 1}
     assert dataclasses.asdict(cfg.rtc.deadline_miss) == {"max_consecutive": 2, "action": "hold_then_stop"}
