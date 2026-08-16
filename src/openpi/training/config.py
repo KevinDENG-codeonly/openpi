@@ -414,13 +414,19 @@ class LeRobotSpiritaiCartesianDataConfig(DataConfigFactory):
     """Config for Spirit AI Cartesian-action datasets in LeRobot format."""
 
     extra_delta_transform: bool = False
+    zero_base_action_targets: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group()
 
         data_transforms = _transforms.Group(
-            inputs=[spiritai_policy.SpiritaiCartesianInputs(model_type=model_config.model_type)],
+            inputs=[
+                spiritai_policy.SpiritaiCartesianInputs(
+                    model_type=model_config.model_type,
+                    zero_base_action_targets=self.zero_base_action_targets,
+                )
+            ],
             outputs=[spiritai_policy.SpiritaiCartesianOutputs()],
         )
 
@@ -1124,6 +1130,7 @@ _CONFIGS = [
             repo_id="spiritai/20260805_FoldBox_SpiritAI_Moz1WB_14Annotations",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+            zero_base_action_targets=True,
         ),
         batch_size=32,
         num_workers=8,

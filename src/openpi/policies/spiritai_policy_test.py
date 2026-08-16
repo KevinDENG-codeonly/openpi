@@ -59,6 +59,23 @@ def test_spiritai_cartesian_inputs_use_cartesian_action_layout() -> None:
     np.testing.assert_array_equal(out["actions"][:, -3:], np.full((2, 3), 7, dtype=np.float32))
 
 
+def test_spiritai_cartesian_inputs_can_zero_base_action_targets() -> None:
+    data = _base_data()
+    for i, key in enumerate(spiritai_policy.CARTESIAN_ACTION_KEYS):
+        dim = 6 if "cart_pos" in key else 1
+        if "base" in key:
+            dim = 3
+        data[key] = np.full((2, dim), i, dtype=np.float32)
+
+    transform = spiritai_policy.SpiritaiCartesianInputs(
+        model_type=_model.ModelType.PI05,
+        zero_base_action_targets=True,
+    )
+    out = transform(data)
+
+    np.testing.assert_array_equal(out["actions"][:, -3:], np.zeros((2, 3), dtype=np.float32))
+
+
 def test_spiritai_cartesian_outputs_drop_model_padding() -> None:
     actions = np.ones((50, 32), dtype=np.float32)
 

@@ -25,7 +25,8 @@ control:
     max_arm_velocity_rad_s: 0.35
     max_torso_velocity_rad_s: 0.2
     max_gripper_velocity_s: 0.8
-    max_base_speed: 0.05
+    # This folding policy never controls the mobile base.
+    max_base_speed: 0.0
     max_joint_accel_rad_s2: 0.0
     max_cart_translation_m_s: 0.08
     max_cart_rotation_rad_s: 0.35
