@@ -1,162 +1,43 @@
-"""Tests for RTC (Real-Time Chunking) implementation."""
+"""Public RTC API compatibility tests."""
+
+import inspect
 
 import numpy as np
-import pytest
+
+from openpi.models.pi0 import Pi0
 
 
-class TestSoftMask:
-    """Test compute_soft_mask (Eq. 5 from arXiv 2506.07339)."""
+def test_pi0_exposes_only_training_time_rtc_arguments() -> None:
+    params = inspect.signature(Pi0.sample_actions).parameters
 
-    def test_shape(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        mask = compute_soft_mask(action_horizon=50, consumed=10, s_min=5)
-        assert mask.shape == (50,)
-        assert mask.dtype == np.float32
-
-    def test_regions(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        horizon, d, s = 50, 10, 5
-        mask = compute_soft_mask(horizon, consumed=d, s_min=s)
-        # Region 1: fully committed (i < d) should be 1
-        np.testing.assert_array_equal(mask[:d], 1.0)
-        # Region 3: free tail (i >= H-s) should be 0
-        np.testing.assert_array_equal(mask[horizon - max(d, s) :], 0.0)
-        # Region 2: transition (d <= i < H-s) should be in (0, 1), monotonically decreasing
-        transition = mask[d : horizon - max(d, s)]
-        assert np.all(transition > 0.0)
-        assert np.all(transition <= 1.0)
-        # Check monotonically non-increasing
-        assert np.all(np.diff(transition) <= 0.0)
-
-    def test_boundary_values(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        # At i=d, c_i is near 1 for a long transition region.
-        # At the final constrained timestep, c_i is near 0.
-        horizon, consumed, s_min = 100, 10, 5
-        free_start = horizon - max(consumed, s_min)
-        mask = compute_soft_mask(horizon, consumed=consumed, s_min=s_min)
-        # First transition value should be close to 1 (but < 1)
-        assert mask[10] < 1.0
-        assert mask[10] > 0.5
-        # Last transition value should be close to 0 (but > 0)
-        assert mask[free_start - 1] > 0.0
-        assert mask[free_start - 1] < 0.5
-        np.testing.assert_array_equal(mask[free_start:], 0.0)
-
-    def test_zero_consumed(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        mask = compute_soft_mask(50, consumed=0, s_min=5)
-        # No fully committed region, transition starts from index 0
-        assert mask[0] < 1.0
-        assert mask[0] > 0.0
-        # Tail is free
-        np.testing.assert_array_equal(mask[45:], 0.0)
-
-    def test_edge_case_large_consumed(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        # consumed + s_min >= H: degenerate case
-        mask = compute_soft_mask(50, consumed=48, s_min=5)
-        assert mask.shape == (50,)
-        # First 48 committed
-        np.testing.assert_array_equal(mask[:48], 1.0)
-        np.testing.assert_array_equal(mask[48:], 0.0)
-
-    def test_consumed_beyond_horizon_has_no_overlap(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        mask = compute_soft_mask(50, consumed=50, s_min=5)
-        np.testing.assert_array_equal(mask, 0.0)
-
-    def test_s_min_zero(self):
-        from openpi.rtc.helpers import compute_soft_mask
-
-        mask = compute_soft_mask(50, consumed=10, s_min=0)
-        # The zero-padded non-overlap tail is still free even when s_min is zero.
-        np.testing.assert_array_equal(mask[40:], 0.0)
+    assert {"rtc_action_prefix", "rtc_delay_steps"} <= params.keys()
+    assert not {
+        "rtc_target_actions",
+        "rtc_target_mask",
+        "rtc_loss_weight",
+        "rtc_target",
+        "rtc_weight",
+        "rtc_beta",
+        "beta",
+    } & params.keys()
+    assert not any("soft" in name or "vjp" in name for name in params)
 
 
-class TestBuildRTCTargetAndMask:
-    """Test build_rtc_target_and_mask."""
+def test_pytorch_pi0_sampler_exposes_no_legacy_rtc_kwargs() -> None:
+    from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
-    def test_basic_shape(self):
-        from openpi.rtc.helpers import build_rtc_target_and_mask
+    params = inspect.signature(PI0Pytorch.sample_actions).parameters
 
-        prev = np.random.randn(50, 32).astype(np.float32)
-        target, mask = build_rtc_target_and_mask(prev, consumed=10, s_min=5)
-        assert target.shape == (50, 32)
-        assert mask.shape == (50,)
-
-    def test_target_shift(self):
-        from openpi.rtc.helpers import build_rtc_target_and_mask
-
-        prev = np.arange(50 * 32).reshape(50, 32).astype(np.float32)
-        target, mask = build_rtc_target_and_mask(prev, consumed=10, s_min=5)
-        # target[:40] should be prev[10:]
-        np.testing.assert_array_equal(target[:40], prev[10:])
-        # target[40:] should be zero-padded
-        np.testing.assert_array_equal(target[40:], 0.0)
-        # zero-padded target positions must be unconstrained
-        np.testing.assert_array_equal(mask[40:], 0.0)
-
-
-class TestRTCState:
-    """Test RTCState controller."""
-
-    def test_initial_no_guidance(self):
-        from openpi.rtc.state import RTCState
-
-        state = RTCState(action_horizon=50, action_dim=32, initial_delay_steps=1)
-        assert state.get_rtc_kwargs() is None
-
-    def test_first_inference_no_guidance(self):
-        from openpi.rtc.state import RTCState
-
-        state = RTCState(action_horizon=50, action_dim=32, initial_delay_steps=1)
-        actions = np.random.randn(50, 32).astype(np.float32)
-        state.update_after_inference(actions)
-        # total_inferences == 1, initial_delay_steps == 1, so the next inference can use guidance
-        assert state.get_rtc_kwargs() is not None
-
-    def test_second_inference_has_guidance(self):
-        from openpi.rtc.state import RTCState
-
-        state = RTCState(action_horizon=50, action_dim=32, initial_delay_steps=1, s_min=5, beta=0.8)
-        actions1 = np.random.randn(50, 32).astype(np.float32)
-        state.update_after_inference(actions1)
-        state.mark_consumed(10)
-        actions2 = np.random.randn(50, 32).astype(np.float32)
-        state.update_after_inference(actions2)
-        state.mark_consumed(10)
-        # Now total_inferences == 2 > initial_delay_steps == 1
-        kwargs = state.get_rtc_kwargs()
-        assert kwargs is not None
-        assert "target" in kwargs
-        assert "mask" in kwargs
-        assert "beta" in kwargs
-        assert kwargs["target"].shape == (50, 32)
-        assert kwargs["mask"].shape == (50,)
-        assert kwargs["beta"] == 0.8
-
-    def test_shape_validation(self):
-        from openpi.rtc.state import RTCState
-
-        state = RTCState(action_horizon=50, action_dim=32)
-        with pytest.raises(AssertionError):
-            state.update_after_inference(np.zeros((25, 32)))
+    assert {"device", "observation", "noise", "num_steps"} <= params.keys()
+    assert not any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    assert not any("rtc" in name or "soft" in name or "vjp" in name for name in params)
 
 
 class TestWebsocketEnvelope:
-    """Test that the server envelope parsing logic handles both old and new formats."""
+    """The policy server keeps its ordinary and training-time envelopes."""
 
-    def test_old_format_is_obs(self):
-        """Old clients send obs dict directly - should work as before."""
+    def test_old_format_is_obs(self) -> None:
         payload = {"observation/image": np.zeros((3, 224, 224)), "prompt": "pick up cup"}
-        # Simulate server parsing logic
         if isinstance(payload, dict) and "obs" in payload:
             obs = payload["obs"]
             rtc = payload.get("rtc")
@@ -166,10 +47,13 @@ class TestWebsocketEnvelope:
         assert obs is payload
         assert rtc is None
 
-    def test_new_format_with_rtc(self):
-        """New format: {"obs": {...}, "rtc": {...}}."""
+    def test_training_time_rtc_envelope(self) -> None:
         inner_obs = {"observation/image": np.zeros((3, 224, 224)), "prompt": "pick up cup"}
-        rtc_data = {"target": np.zeros((50, 32)), "mask": np.ones(50), "beta": 0.8}
+        rtc_data = {
+            "algorithm": "training_time_v1",
+            "action_prefix": np.zeros((50, 32), dtype=np.float32),
+            "delay_steps": 10,
+        }
         payload = {"obs": inner_obs, "rtc": rtc_data}
         if isinstance(payload, dict) and "obs" in payload:
             obs = payload["obs"]
@@ -179,9 +63,11 @@ class TestWebsocketEnvelope:
             rtc = None
         assert obs is inner_obs
         assert rtc is rtc_data
+        assert set(rtc) == {"algorithm", "action_prefix", "delay_steps"}
+        assert rtc["action_prefix"].shape == (50, 32)
+        assert isinstance(rtc["delay_steps"], int)
 
-    def test_new_format_without_rtc(self):
-        """New format with rtc=None should behave like no RTC."""
+    def test_new_format_without_rtc(self) -> None:
         inner_obs = {"prompt": "test"}
         payload = {"obs": inner_obs, "rtc": None}
         if isinstance(payload, dict) and "obs" in payload:
@@ -195,31 +81,18 @@ class TestWebsocketEnvelope:
 
 
 class TestDefaultBehaviorCompatibility:
-    """Verify that default (no-RTC) behavior is preserved at the interface level."""
+    """The no-RTC policy interfaces remain optional and backward compatible."""
 
-    def test_policy_infer_signature_default(self):
-        """Policy.infer with rtc=None should not error on interface level."""
-        import inspect
-
+    def test_policy_infer_signature_default(self) -> None:
         from openpi.policies.policy import Policy
 
-        # Check that the method signature accepts rtc kwarg
-        sig = inspect.signature(Policy.infer)
-        params = sig.parameters
-        assert "rtc" in params
+        params = inspect.signature(Policy.infer).parameters
         assert params["rtc"].default is None
-        assert "return_model_actions" in params
         assert params["return_model_actions"].default is False
 
-    def test_client_infer_signature(self):
-        """WebsocketClientPolicy.infer accepts optional rtc kwarg."""
-        import inspect
-
+    def test_client_infer_signature(self) -> None:
         from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
-        sig = inspect.signature(WebsocketClientPolicy.infer)
-        params = sig.parameters
-        assert "rtc" in params
+        params = inspect.signature(WebsocketClientPolicy.infer).parameters
         assert params["rtc"].default is None
-        assert "return_model_actions" in params
         assert params["return_model_actions"].default is False

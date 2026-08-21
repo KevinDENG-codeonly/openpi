@@ -1,0 +1,848 @@
+"""Tests for the SpiritAI training-time RTC entrypoint."""
+
+from __future__ import annotations
+
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
+import dataclasses
+import importlib.util
+import inspect
+from pathlib import Path
+import socket
+import sys
+import threading
+from types import SimpleNamespace
+from uuid import uuid4
+
+import numpy as np
+import pytest
+
+from openpi.policies import spiritai_bridge
+from openpi.rtc import ActionPlan
+from openpi.rtc import RTCController
+from openpi.rtc import RTCRequest
+from openpi.rtc.worker import RTCInferenceResult
+
+MAIN_PATH = Path(__file__).with_name("main.py")
+
+
+def load_main_module():
+    """Load the example entrypoint without making its directory a package."""
+    module_name = f"spirit_ai_main_test_{uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, MAIN_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    return module
+
+
+def make_runtime(*, planned_max_steps: int = 2):
+    return SimpleNamespace(
+        rtc=SimpleNamespace(delay=SimpleNamespace(planned_max_steps=planned_max_steps)),
+    )
+
+
+def make_policy_metadata(*, horizon: int = 4, action_dim: int = 2, max_delay_steps: int = 2):
+    return {
+        "rtc_capabilities": {
+            "algorithm": "training_time_v1",
+            "action_horizon": horizon,
+            "action_dim": action_dim,
+            "training_max_delay_steps": max_delay_steps,
+        }
+    }
+
+
+def make_joint_observation() -> tuple[dict, dict]:
+    obs = {
+        "leftarm_state_joint_pos": np.zeros(7, dtype=np.float32),
+        "leftarm_state_psi": np.zeros(1, dtype=np.float32),
+        "leftarm_gripper_state_pos": np.zeros(1, dtype=np.float32),
+        "rightarm_state_joint_pos": np.zeros(7, dtype=np.float32),
+        "rightarm_state_psi": np.zeros(1, dtype=np.float32),
+        "rightarm_gripper_state_pos": np.zeros(1, dtype=np.float32),
+        "torso_state_joint_pos": np.zeros(6, dtype=np.float32),
+        "base_state_speed": np.zeros(3, dtype=np.float32),
+    }
+    images = {
+        "cam_high": np.zeros((2, 2, 3), dtype=np.uint8),
+        "cam_left_wrist": np.zeros((2, 2, 3), dtype=np.uint8),
+        "cam_right_wrist": np.zeros((2, 2, 3), dtype=np.uint8),
+    }
+    return obs, images
+
+
+def test_bootstrap_defaults_use_the_source_relative_runtime_config():
+    main = load_main_module()
+
+    expected_config = MAIN_PATH.parent / "configs" / "rtc" / "training_time.yaml"
+    assert expected_config == main.DEFAULT_RUNTIME_CONFIG
+    assert main.BootstrapArgs() == main.BootstrapArgs(config=expected_config, dry_run=False)
+    assert main.BootstrapArgs.__dataclass_params__.frozen is True
+    assert not hasattr(main, "Args")
+
+
+def test_importing_main_does_not_read_runtime_config(monkeypatch):
+    original_read_text = Path.read_text
+
+    def fail_if_yaml_is_read(path: Path, *args, **kwargs):
+        if path.suffix == ".yaml":
+            raise AssertionError(f"main import unexpectedly read {path}")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_if_yaml_is_read)
+
+    load_main_module()
+
+
+def test_validate_rtc_runtime_metadata_returns_model_dimensions():
+    main = load_main_module()
+
+    capability = main.validate_rtc_runtime_metadata(make_runtime(), make_policy_metadata())
+
+    assert capability.action_horizon == 4
+    assert capability.action_dim == 2
+    assert capability.training_max_delay_steps == 2
+
+
+@pytest.mark.parametrize(
+    ("runtime", "metadata", "message"),
+    [
+        (make_runtime(planned_max_steps=3), make_policy_metadata(max_delay_steps=2), "planned_max_steps"),
+        (make_runtime(), {}, "rtc_capabilities"),
+        (make_runtime(), {"rtc_capabilities": {"algorithm": "disabled"}}, "algorithm"),
+        (make_runtime(), make_policy_metadata(horizon=0), "action_horizon"),
+        (make_runtime(), make_policy_metadata(action_dim=True), "action_dim"),
+        (make_runtime(), make_policy_metadata(max_delay_steps=-1), "training_max_delay_steps"),
+    ],
+)
+def test_validate_rtc_runtime_metadata_rejects_incompatible_capabilities(runtime, metadata, message):
+    main = load_main_module()
+
+    with pytest.raises(ValueError, match=message):
+        main.validate_rtc_runtime_metadata(runtime, metadata)
+
+
+def test_policy_worker_owns_connection_metadata_and_all_inference_calls():
+    main = load_main_module()
+    obs, images = make_joint_observation()
+    action_prefix = np.zeros((4, 2), dtype=np.float32)
+    action_prefix[:2] = [[10.0, 11.0], [12.0, 13.0]]
+    request = RTCRequest(
+        request_id=7,
+        source_generation_tick=0,
+        start_tick=3,
+        planned_delay_steps=2,
+        execution_horizon=3,
+        action_prefix=action_prefix,
+        frozen_prefix=action_prefix[:2],
+    )
+
+    main_thread_id = threading.get_ident()
+    factory_thread_ids = []
+    metadata_thread_ids = []
+    inference_thread_ids = []
+
+    class FakePolicy:
+        def __init__(self):
+            self.calls = []
+
+        def get_server_metadata(self):
+            metadata_thread_ids.append(threading.get_ident())
+            return make_policy_metadata()
+
+        def infer(self, policy_obs, *, rtc, return_model_actions):
+            inference_thread_ids.append(threading.get_ident())
+            self.calls.append((policy_obs, rtc, return_model_actions))
+            return {
+                "actions": np.full((4, 27), 5.0, dtype=np.float32),
+                "model_actions": np.arange(8, dtype=np.float32).reshape(4, 2),
+            }
+
+    policy = FakePolicy()
+
+    def policy_factory():
+        factory_thread_ids.append(threading.get_ident())
+        return policy
+
+    policy_worker = main.PolicyRTCWorker(
+        runtime=make_runtime(),
+        prompt="fold the paper box",
+        policy_action_layout="joint",
+        policy_factory=policy_factory,
+    )
+    try:
+        rtc_metadata = policy_worker.submit(main.PolicyBootstrapTask()).result().value
+        initial_plan = policy_worker.submit(main.InitialInferenceTask(obs=obs, images=images)).result().value
+        plan = policy_worker.submit(main.RTCInferenceTask(request=request, obs=obs, images=images)).result().value
+    finally:
+        policy_worker.close()
+
+    assert isinstance(rtc_metadata, main.RTCRuntimeMetadata)
+    assert isinstance(initial_plan, ActionPlan)
+    assert isinstance(plan, ActionPlan)
+    assert len(policy.calls) == 2
+    policy_obs, rtc, return_model_actions = policy.calls[1]
+    assert policy_obs["prompt"] == "fold the paper box"
+    assert rtc["algorithm"] == "training_time_v1"
+    np.testing.assert_array_equal(rtc["action_prefix"], action_prefix)
+    assert rtc["delay_steps"] == 2
+    assert return_model_actions is True
+    assert plan.generation_tick == request.start_tick
+    assert plan.model_actions.shape == (4, 2)
+    assert plan.robot_actions.shape == (4, 27)
+    assert len(metadata_thread_ids) == 1
+    assert len(factory_thread_ids) == 1
+    assert set(factory_thread_ids + metadata_thread_ids + inference_thread_ids).isdisjoint({main_thread_id})
+    assert len(set(factory_thread_ids + metadata_thread_ids + inference_thread_ids)) == 1
+
+
+def test_policy_worker_close_cancels_and_closes_a_blocked_policy_call():
+    main = load_main_module()
+    obs, images = make_joint_observation()
+    inference_started = threading.Event()
+    close_released_inference = threading.Event()
+    close_thread_ids = []
+
+    class BlockingPolicy:
+        def get_server_metadata(self):
+            return make_policy_metadata()
+
+        def infer(self, policy_obs, *, rtc, return_model_actions):
+            inference_started.set()
+            assert close_released_inference.wait(timeout=1)
+            return {
+                "actions": np.zeros((4, 27), dtype=np.float32),
+                "model_actions": np.zeros((4, 2), dtype=np.float32),
+            }
+
+        def close(self):
+            close_thread_ids.append(threading.get_ident())
+            close_released_inference.set()
+
+    policy_worker = main.PolicyRTCWorker(
+        runtime=make_runtime(),
+        prompt="fold the paper box",
+        policy_action_layout="joint",
+        policy_factory=BlockingPolicy,
+    )
+    try:
+        policy_worker.submit(main.PolicyBootstrapTask()).result(timeout=1)
+        future = policy_worker.submit(main.InitialInferenceTask(obs=obs, images=images))
+        assert inference_started.wait(timeout=1)
+
+        policy_worker.close(wait=False)
+
+        assert policy_worker._cancel_event.is_set()  # noqa: SLF001
+        assert close_thread_ids == [threading.get_ident()]
+        assert isinstance(future.result(timeout=1).value, ActionPlan)
+    finally:
+        policy_worker.close()
+
+    assert len(close_thread_ids) == 1
+
+
+def test_policy_worker_passes_configured_connect_timeout_to_client_factory(monkeypatch):
+    main = load_main_module()
+    client_kwargs = []
+
+    class FakePolicyClient:
+        pass
+
+    def make_client(**kwargs):
+        client_kwargs.append(kwargs)
+        return FakePolicyClient()
+
+    monkeypatch.setattr(main._websocket_client_policy, "WebsocketClientPolicy", make_client)  # noqa: SLF001
+    policy_worker = main.PolicyRTCWorker(
+        runtime=SimpleNamespace(policy=SimpleNamespace(host="policy", port=8000, connect_timeout_s=0.25)),
+        prompt="fold the paper box",
+        policy_action_layout="joint",
+    )
+
+    policy_worker._default_policy_factory()  # noqa: SLF001
+    policy_worker.close()
+
+    assert client_kwargs == [
+        {
+            "host": "policy",
+            "port": 8000,
+            "connect_timeout_s": 0.25,
+            "cancel_event": policy_worker._cancel_event,  # noqa: SLF001
+        }
+    ]
+
+
+def test_terminal_hold_ack_timeout_uses_bound_without_advancing_tick():
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    received_timeouts = []
+
+    class TimeoutRobotSocket:
+        def recv(self, *, timeout):
+            received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    with pytest.raises(RuntimeError, match="terminal hold ACK timed out after 0.25s"):
+        main._wait_for_robot_command_ack(  # noqa: SLF001
+            TimeoutRobotSocket(),
+            timeout_s=0.25,
+            operation="terminal hold",
+        )
+
+    assert received_timeouts == [0.25]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_connection_uses_command_ack_timeout_for_open(monkeypatch):
+    main = load_main_module()
+    connect_calls = []
+
+    class FakeRawSocket:
+        def send(self, data, flags):
+            raise AssertionError("the connection setup must not send data")
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FakeRawSocket()
+
+    connection = FakeConnection()
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr(main.websockets.sync.client, "connect", connect)
+
+    assert main._open_robot_connection("ws://robot", timeout_s=0.25) is connection  # noqa: SLF001
+    assert connect_calls == [
+        (
+            ("ws://robot",),
+            {"max_size": None, "compression": None, "open_timeout": 0.25},
+        )
+    ]
+    assert isinstance(connection.socket, main._SocketWriteDeadlineProxy)  # noqa: SLF001
+
+
+def test_robot_write_deadline_requires_a_usable_socket():
+    main = load_main_module()
+
+    with pytest.raises(RuntimeError, match="does not expose a usable socket for total write deadline"):
+        main._install_total_write_deadline(object(), timeout_s=0.25)  # noqa: SLF001
+
+
+def test_robot_write_deadline_rejects_tls_socket(monkeypatch):
+    main = load_main_module()
+
+    class FakeTLSSocket:
+        def send(self, data, flags):
+            raise AssertionError("TLS socket must not be wrapped for MSG_DONTWAIT sends")
+
+    class FakeConnection:
+        def __init__(self):
+            self.socket = FakeTLSSocket()
+
+    monkeypatch.setattr(main, "ssl", SimpleNamespace(SSLSocket=FakeTLSSocket), raising=False)
+    connection = FakeConnection()
+
+    with pytest.raises(RuntimeError, match="non-TLS ws://"):
+        main._install_total_write_deadline(connection, timeout_s=0.25)  # noqa: SLF001
+
+    assert isinstance(connection.socket, FakeTLSSocket)
+
+
+def test_robot_tls_write_deadline_setup_failure_closes_the_transport(monkeypatch):
+    main = load_main_module()
+
+    class FakeTLSSocket:
+        def send(self, data, flags):
+            raise AssertionError("TLS socket must not be wrapped for MSG_DONTWAIT sends")
+
+    class FakeConnection:
+        socket = FakeTLSSocket()
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    connection = FakeConnection()
+    monkeypatch.setattr(main, "ssl", SimpleNamespace(SSLSocket=FakeTLSSocket))
+    monkeypatch.setattr(main.websockets.sync.client, "connect", lambda *args, **kwargs: connection)
+
+    with pytest.raises(RuntimeError, match="non-TLS ws://"):
+        main._open_robot_connection("ws://robot", timeout_s=0.25)  # noqa: SLF001
+
+    assert connection.close_calls == 1
+
+
+def test_robot_write_deadline_proxy_does_not_reset_its_deadline_after_partial_writes(monkeypatch):
+    main = load_main_module()
+    clock = [0.0]
+    select_timeouts = []
+
+    class FakeRawSocket:
+        def __init__(self):
+            self.send_calls = []
+            self.shutdown_calls = []
+            self.close_calls = 0
+
+        def send(self, data, flags):
+            self.send_calls.append((bytes(data), flags))
+            clock[0] += 0.25
+            return 1
+
+        def recv(self, size):
+            return b"received"
+
+        def fileno(self):
+            return 42
+
+        def shutdown(self, how):
+            self.shutdown_calls.append(how)
+            return "shutdown"
+
+        def close(self):
+            self.close_calls += 1
+
+    raw_socket = FakeRawSocket()
+
+    def monotonic():
+        return clock[0]
+
+    def select(readable, writable, exceptional, timeout):
+        assert readable == []
+        assert writable == [raw_socket]
+        assert exceptional == []
+        select_timeouts.append(timeout)
+        if len(select_timeouts) < 3:
+            return [], [raw_socket], []
+        clock[0] += timeout
+        return [], [], []
+
+    monkeypatch.setattr(main.time, "monotonic", monotonic)
+    monkeypatch.setattr(main.select, "select", select)
+    proxy = main._SocketWriteDeadlineProxy(raw_socket, timeout_s=1.0)  # noqa: SLF001
+
+    with pytest.raises(TimeoutError, match="Websocket send timed out"):
+        proxy.sendall(b"abcd", flags=0x100)
+
+    assert select_timeouts == pytest.approx([1.0, 0.75, 0.5])
+    assert raw_socket.send_calls == [
+        (b"abcd", 0x100 | socket.MSG_DONTWAIT),
+        (b"bcd", 0x100 | socket.MSG_DONTWAIT),
+    ]
+    assert proxy.recv(1) == b"received"
+    assert proxy.fileno() == 42
+    assert proxy.shutdown(socket.SHUT_RDWR) == "shutdown"
+    proxy.close()
+    assert raw_socket.shutdown_calls == [socket.SHUT_RDWR]
+    assert raw_socket.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("robot_url", "policy_host"),
+    [
+        ("wss://robot", "localhost"),
+        ("ws://robot", "wss://policy"),
+    ],
+)
+def test_training_time_rtc_transport_validation_rejects_wss(robot_url, policy_host):
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url=robot_url),
+        policy=SimpleNamespace(host=policy_host),
+    )
+
+    with pytest.raises(RuntimeError, match="requires ws://"):
+        main._validate_training_time_rtc_transport_safety(runtime)  # noqa: SLF001
+
+
+def test_training_time_rtc_transport_validation_accepts_ws_and_unschemed_policy_host():
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url="ws://robot"),
+        policy=SimpleNamespace(host="localhost"),
+    )
+
+    assert main._validate_training_time_rtc_transport_safety(runtime) is None  # noqa: SLF001
+
+
+def test_main_rejects_wss_before_creating_the_policy_worker(monkeypatch):
+    main = load_main_module()
+    runtime = SimpleNamespace(
+        robot=SimpleNamespace(url="wss://robot", action_layout="joint"),
+        policy=SimpleNamespace(host="localhost"),
+        rtc=SimpleNamespace(mode="training_time"),
+        control=SimpleNamespace(source_hz=15.0),
+    )
+    policy_worker_created = []
+
+    monkeypatch.setattr(main, "load_runtime_config", lambda _path: runtime)
+    monkeypatch.setattr(
+        main,
+        "PolicyRTCWorker",
+        lambda **_kwargs: policy_worker_created.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="requires ws://"):
+        main.main(main.BootstrapArgs())
+
+    assert policy_worker_created == []
+
+
+def test_robot_write_deadline_proxy_rejects_a_zero_byte_write(monkeypatch):
+    main = load_main_module()
+
+    class FakeRawSocket:
+        def send(self, data, flags):
+            return 0
+
+    raw_socket = FakeRawSocket()
+    monkeypatch.setattr(main.select, "select", lambda *_args: ([], [raw_socket], []))
+    proxy = main._SocketWriteDeadlineProxy(raw_socket, timeout_s=1.0)  # noqa: SLF001
+
+    with pytest.raises(OSError, match="zero-byte"):
+        proxy.sendall(b"x")
+
+
+@pytest.mark.parametrize(
+    ("invoke", "expected_message_type", "timeout_message"),
+    [
+        (
+            lambda main, socket: main._wait_until_robot_idle(  # noqa: SLF001
+                socket,
+                0.0,
+                timeout_s=0.25,
+                idle_timeout_s=1.0,
+            ),
+            "get_status",
+            "robot status response timed out after 0.25s",
+        ),
+        (
+            lambda main, socket: main._get_robot_obs(socket, timeout_s=0.25),  # noqa: SLF001
+            "get_obs",
+            "robot observation response timed out after 0.25s",
+        ),
+        (
+            lambda main, socket: main._set_robot_external_following(socket, enabled=True, timeout_s=0.25),  # noqa: SLF001
+            "set_external_following",
+            "external-following response timed out after 0.25s",
+        ),
+    ],
+)
+def test_robot_preflight_recv_timeout_is_bounded_before_any_command_or_tick(
+    invoke, expected_message_type, timeout_message
+):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+
+    class TimeoutRobotSocket:
+        def __init__(self):
+            self.sent = []
+            self.received_timeouts = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self, *, timeout):
+            self.received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    robot_ws = TimeoutRobotSocket()
+    with pytest.raises(RuntimeError, match=timeout_message):
+        invoke(main, robot_ws)
+
+    assert robot_ws.received_timeouts == [0.25]
+    assert [spiritai_bridge.unpack_robot_server_message(message)["type"] for message in robot_ws.sent] == [
+        expected_message_type
+    ]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_idle_wait_has_a_total_deadline_without_sending_a_command(monkeypatch):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    clock = [0.0]
+    slept = []
+
+    class AlwaysBusyRobotSocket:
+        def __init__(self):
+            self.sent = []
+            self.received_timeouts = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def recv(self, *, timeout):
+            self.received_timeouts.append(timeout)
+            return spiritai_bridge.pack_robot_server_message({"busy": True})
+
+    def monotonic():
+        return clock[0]
+
+    def sleep(duration):
+        slept.append(duration)
+        clock[0] += duration
+
+    monkeypatch.setattr(main.time, "monotonic", monotonic)
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    robot_ws = AlwaysBusyRobotSocket()
+
+    with pytest.raises(RuntimeError, match="robot did not become idle within 1s"):
+        main._wait_until_robot_idle(  # noqa: SLF001
+            robot_ws,
+            busy_sleep_s=0.4,
+            timeout_s=0.25,
+            idle_timeout_s=1.0,
+        )
+
+    assert robot_ws.received_timeouts == pytest.approx([0.25, 0.25, 0.2])
+    assert slept == pytest.approx([0.4, 0.4, 0.2])
+    assert [spiritai_bridge.unpack_robot_server_message(message)["type"] for message in robot_ws.sent] == [
+        "get_status",
+        "get_status",
+        "get_status",
+    ]
+    assert controller.accepted_tick == 0
+
+
+def test_robot_hello_recv_timeout_is_bounded_before_any_command_or_tick():
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    received_timeouts = []
+
+    class TimeoutRobotSocket:
+        def recv(self, *, timeout):
+            received_timeouts.append(timeout)
+            raise TimeoutError()
+
+    with pytest.raises(RuntimeError, match="robot hello timed out after 0.25s"):
+        main._recv_robot_response(  # noqa: SLF001
+            TimeoutRobotSocket(),
+            timeout_s=0.25,
+            operation="robot hello",
+        )
+
+    assert received_timeouts == [0.25]
+    assert controller.accepted_tick == 0
+
+
+def test_main_delegates_all_policy_ownership_to_policy_rtc_worker():
+    main = load_main_module()
+    main_source = inspect.getsource(main.main)
+
+    assert "PolicyRTCWorker(" in main_source
+    assert "WebsocketClientPolicy(" not in main_source
+    assert ".get_server_metadata(" not in main_source
+    assert "_infer_policy_chunk(" not in main_source
+
+
+def test_expired_slow_worker_result_is_discarded_and_the_active_plan_can_retry():
+    main = load_main_module()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    original_plan = ActionPlan(
+        generation_tick=0,
+        model_actions=np.arange(16, dtype=np.float32).reshape(8, 2),
+        robot_actions=np.zeros((8, 3), dtype=np.float32),
+    )
+    controller.install_initial_plan(original_plan)
+    request = controller.start_request(current_tick=1, planned_delay_steps=1)
+    future = Future()
+    flight = main.RTCInferenceFlight(request=request, future=future)
+
+    assert flight.expire_if_due(controller, current_tick=1) is False
+    assert flight.expire_if_due(controller, current_tick=2) is True
+    assert flight.expired is True
+    assert controller.current_plan is original_plan
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 1
+
+    future.set_result(
+        RTCInferenceResult(
+            value=ActionPlan(
+                generation_tick=1,
+                model_actions=np.full((8, 2), 99.0, dtype=np.float32),
+                robot_actions=np.full((8, 3), 99.0, dtype=np.float32),
+            ),
+            started_at=1.0,
+            finished_at=2.0,
+        )
+    )
+    assert flight.completed_result() is None
+    assert controller.current_plan is original_plan
+
+    retry = controller.start_request(current_tick=2, planned_delay_steps=1)
+    assert retry.request_id == 1
+    assert retry.start_tick == 2
+    np.testing.assert_array_equal(retry.frozen_prefix, original_plan.model_actions[2:3])
+
+
+def test_never_completing_worker_is_expired_and_counts_toward_stop_budget():
+    main = load_main_module()
+    controller = RTCController(action_horizon=8, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(
+        ActionPlan(
+            generation_tick=0,
+            model_actions=np.zeros((8, 2), dtype=np.float32),
+            robot_actions=np.zeros((8, 3), dtype=np.float32),
+        )
+    )
+    request = controller.start_request(current_tick=1, planned_delay_steps=1)
+    future = Future()
+    flight = main.RTCInferenceFlight(request=request, future=future)
+
+    assert flight.expire_if_due(controller, current_tick=2) is True
+    assert future.done() is False
+    controller.record_worker_unavailable()
+
+    assert controller.inflight_request is None
+    assert controller.deadline_miss_count == 2
+    assert controller.consecutive_deadline_misses == 2
+
+
+def test_robot_session_closes_robot_before_abandoning_a_hung_policy_worker():
+    main = load_main_module()
+    events = []
+
+    class FakePolicyWorker:
+        def close(self, *, wait=True):
+            events.append(("policy_close", wait))
+
+    class FakeRobotConnection:
+        def __enter__(self):
+            events.append(("robot_enter", None))
+            return object()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("robot_exit", None))
+
+    with main._robot_session_with_policy_cleanup(  # noqa: SLF001
+        FakeRobotConnection(),
+        FakePolicyWorker(),
+        wait_for_policy=lambda: False,
+    ):
+        events.append(("loop_stop", None))
+
+    assert events == [
+        ("robot_enter", None),
+        ("loop_stop", None),
+        ("robot_exit", None),
+        ("policy_close", False),
+    ]
+
+
+def test_synchronous_policy_wait_uses_the_configured_timeout():
+    main = load_main_module()
+    timeouts = []
+
+    class TimedOutFuture:
+        def result(self, *, timeout):
+            timeouts.append(timeout)
+            raise FutureTimeoutError()
+
+    with pytest.raises(RuntimeError, match="initial policy inference timed out after 0.25s"):
+        main._wait_for_policy_worker_result(  # noqa: SLF001
+            TimedOutFuture(),
+            timeout_s=0.25,
+            operation="initial policy inference",
+        )
+
+    assert timeouts == [0.25]
+
+
+def test_robot_session_closes_robot_before_abandoning_timed_out_initial_inference():
+    main = load_main_module()
+    events = []
+    initial_future = Future()
+
+    class FakePolicyWorker:
+        def close(self, *, wait=True):
+            events.append(("policy_close", wait))
+
+    class FakeRobotConnection:
+        def __enter__(self):
+            events.append(("robot_enter", None))
+            return object()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("robot_exit", None))
+
+    with main._robot_session_with_policy_cleanup(  # noqa: SLF001
+        FakeRobotConnection(),
+        FakePolicyWorker(),
+        wait_for_policy=lambda: main._policy_worker_cleanup_can_wait(  # noqa: SLF001
+            bootstrap_future=None,
+            initial_inference_future=initial_future,
+            flight=None,
+        ),
+    ):
+        events.append(("initial_timeout", None))
+
+    assert events == [
+        ("robot_enter", None),
+        ("initial_timeout", None),
+        ("robot_exit", None),
+        ("policy_close", False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("worker_misses", "rpc_budget_misses", "expected_reason"),
+    [
+        (2, 0, "worker inference failed or missed its deadline"),
+        (0, 2, "RPC budget exceeded"),
+    ],
+)
+def test_stop_threshold_replaces_a_stale_plan_action_with_a_one_row_hold(
+    worker_misses: int,
+    rpc_budget_misses: int,
+    expected_reason: str,
+):
+    main = load_main_module()
+    controller = RTCController(action_horizon=4, action_dim=2, s_min=1, training_max_delay_steps=2)
+    controller.install_initial_plan(
+        ActionPlan(
+            generation_tick=0,
+            model_actions=np.ones((4, 2), dtype=np.float32),
+            robot_actions=np.full((4, 3), 9.0, dtype=np.float32),
+        )
+    )
+    reason = main._hold_then_stop_reason(  # noqa: SLF001
+        worker_misses=worker_misses,
+        rpc_budget_misses=rpc_budget_misses,
+        max_consecutive=2,
+        action="hold_then_stop",
+    )
+
+    dispatch, stop_after_dispatch = main._dispatch_for_stop_or_plan(  # noqa: SLF001
+        controller,
+        current_tick=0,
+        stop_reason=reason,
+    )
+    command = main._one_row_command_for_dispatch(  # noqa: SLF001
+        dispatch_kind=dispatch.kind,
+        robot_action=dispatch.robot_action,
+        current_state=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        policy_action_layout="joint",
+        command_dim=3,
+    )
+
+    assert reason == expected_reason
+    assert stop_after_dispatch == expected_reason
+    assert dispatch.kind == "hold"
+    np.testing.assert_array_equal(command, [[1.0, 2.0, 3.0]])
+
+
+def test_bootstrap_args_is_a_frozen_dataclass():
+    main = load_main_module()
+
+    assert dataclasses.is_dataclass(main.BootstrapArgs)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        main.BootstrapArgs().dry_run = True

@@ -15,6 +15,8 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.rtc.capabilities import RTCRequestError
+from openpi.rtc.capabilities import validate_training_time_request
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -94,28 +96,14 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        # RTC (Real-Time Chunking) guidance parameters
         if rtc is not None:
-            rtc_target = rtc.get("target")
-            rtc_mask = rtc.get("mask")
-            rtc_beta = float(rtc.get("beta", 1.0))
-            if rtc_target is not None and rtc_mask is not None:
-                if self._is_pytorch_model:
-                    sample_kwargs["rtc_target"] = torch.from_numpy(np.asarray(rtc_target)).to(self._pytorch_device)
-                    # Precompute weight: clip(beta * mask)[..., None] -> (b, ah, 1)
-                    weight = np.clip(rtc_beta * np.asarray(rtc_mask, dtype=np.float32), 0.0, 1.0)
-                    sample_kwargs["rtc_weight"] = torch.from_numpy(weight).to(self._pytorch_device)
-                else:
-                    rtc_target_arr = jnp.asarray(rtc_target)
-                    if rtc_target_arr.ndim == 2:
-                        rtc_target_arr = rtc_target_arr[None, ...]
-                    sample_kwargs["rtc_target"] = rtc_target_arr
-                    # Precompute weight: clip(beta * mask)[..., None] -> (b, ah, 1)
-                    rtc_mask_arr = np.clip(rtc_beta * np.asarray(rtc_mask, dtype=np.float32), 0.0, 1.0)
-                    rtc_weight_arr = jnp.asarray(rtc_mask_arr)
-                    if rtc_weight_arr.ndim == 1:
-                        rtc_weight_arr = rtc_weight_arr[None, ...]
-                    sample_kwargs["rtc_weight"] = rtc_weight_arr[..., None]  # (b, ah, 1)
+            action_prefix, delay_steps = validate_training_time_request(
+                rtc, self.metadata.get("rtc_capabilities")
+            )
+            if self._is_pytorch_model:
+                raise RTCRequestError("Training-time RTC is not supported by PyTorch policies.")
+            sample_kwargs["rtc_action_prefix"] = jnp.asarray(action_prefix, dtype=jnp.float32)[None, ...]
+            sample_kwargs["rtc_delay_steps"] = jnp.asarray([delay_steps], dtype=jnp.int32)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

@@ -183,3 +183,6 @@ cython_debug/
 
 #codex
 .codex
+
+# Local git worktrees used by development agents.
+.worktrees/

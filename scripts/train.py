@@ -147,7 +147,10 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        loss_kwargs: dict[str, int] = {}
+        if config.rtc_training.enabled:
+            loss_kwargs["rtc_max_delay_steps"] = config.rtc_training.max_delay_steps
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True, **loss_kwargs)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)

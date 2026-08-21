@@ -173,13 +173,17 @@ class SpiritaiCartesianInputs(transforms.DataTransformFn):
     """Converts Spirit AI Cartesian dataset fields into the model input format."""
 
     model_type: _model.ModelType
+    zero_base_action_targets: bool = False
 
     def __call__(self, data: dict) -> dict:
-        return _build_policy_inputs(
+        inputs = _build_policy_inputs(
             data,
             state_keys=CARTESIAN_STATE_KEYS,
             action_keys=CARTESIAN_ACTION_KEYS,
         )
+        if self.zero_base_action_targets and "actions" in inputs:
+            inputs["actions"][..., -3:] = 0.0
+        return inputs
 
 
 @dataclasses.dataclass(frozen=True)

@@ -1,168 +1,88 @@
-# Spirit AI Motion Smoothness Benchmark
+# Spirit AI Training-Time RTC Motion Benchmark
 
-This benchmark is for quickly finding a practical balance between low jitter and good action continuity during real robot inference.
+Use this benchmark to choose a measured YAML profile for the training-time RTC
+runner. It does not use the retired per-run chunk, prefetch, or RTC-guidance flags.
 
-## Goal
+## Preconditions
 
-Tune these runtime parameters:
+- Use a JAX Pi0.5 checkpoint trained with `rtc_training.enabled`; its policy metadata
+  must advertise `training_time_v1`.
+- Use non-TLS `ws://` robot and policy endpoints. The runner rejects `wss://` before
+  policy or hardware activity because it cannot enforce the required total write
+  deadline on Python TLS sockets.
+- Measure end-to-end latency at the intended control frequency before training and
+  deployment. The checkpoint training `max_delay_steps` and YAML
+  `rtc.delay.planned_max_steps` must use the same measured safe range.
+- Start each new profile with dry run:
 
-- `--source-hz`
-- `--max-arm-velocity-rad-s`
-- `--max-torso-velocity-rad-s`
-- `--max-joint-accel-rad-s2`
+```bash
+uv run examples/spirit-ai/main.py --config PATH --dry-run
+```
 
-Use short real robot runs first. Start every candidate with `--max-steps 5`; only increase to `20` after the robot motion looks safe.
+After dry-run validation and explicit operator authorization, omit `--dry-run` for
+one low-speed real-robot run using the same profile.
 
-## What To Record
+## YAML profile sweep
 
-For each run, record:
+Copy `examples/spirit-ai/configs/rtc/training_time.yaml` for each candidate and
+change only the fields being evaluated. The primary benchmark fields are:
 
-| Run | source_hz | arm_vel | torso_vel | accel | jitter 1-5 | continuity 1-5 | task intent 1-5 | avg limited_fraction | notes |
-|-----|-----------|---------|-----------|-------|------------|----------------|-----------------|----------------------|-------|
-|     |           |         |           |       |            |                |                 |                      |       |
+- `control.source_hz`
+- `control.motion_limits.max_arm_velocity_rad_s`
+- `control.motion_limits.max_torso_velocity_rad_s`
+- `control.motion_limits.max_joint_accel_rad_s2`
+- `control.max_steps`
+
+Keep the timeout and transport settings unchanged unless the benchmark specifically
+measures them: `policy.connect_timeout_s`, `rtc.initial_inference_timeout_s`,
+`control.command_ack_timeout_s`, and `control.robot_idle_timeout_s` are safety
+bounds, not throughput knobs.
+
+## What to record
+
+For every profile, record the required runtime metrics and operator observations:
+
+| Run | Profile | dplan | dactual | misses | holds | switch command delta | control frequency | e2e inference latency | jitter 1-5 | task intent 1-5 | notes |
+|-----|---------|-------|---------|--------|-------|----------------------|-------------------|-----------------------|------------|-----------------|-------|
+|     |         |       |         |        |       |                      |                   |                       |            |                 |       |
 
 Scoring:
 
 - `jitter`: `1` = very shaky, `5` = stable.
-- `continuity`: `1` = stop-and-go, `5` = smooth continuous motion.
 - `task intent`: `1` = no useful task progress, `5` = clearly progressing.
+- Any deadline miss, hold, command ACK timeout, or RPC-budget stop requires latency
+  investigation before increasing control frequency or continuing the sweep.
 
-Log interpretation:
+## Phase 1: Find `control.source_hz`
 
-- `limited_fraction > 0.7`: limiter is changing most of the policy output; motion may become too slow or off-distribution.
-- `limited_fraction 0.2-0.6`: usually a useful range.
-- `limited_fraction < 0.1` but motion still shakes: jitter is probably not caused by the bridge velocity limiter.
+Keep the motion-limit fields fixed in the YAML candidates. Begin with the measured
+training rate and test only frequencies that leave adequate read-only RPC and command
+ACK budget. For example, prepare separate profiles at `15.0`, `20.0`, `25.0`, and
+`12.0` Hz; reject a candidate if its latency metrics exceed the trained/planned delay
+budget or it causes misses/holds.
 
-## Fixed Baseline Command
+Do not choose a higher frequency solely because motion appears smoother. The selected
+profile must also sustain its measured control frequency and retain a safe command
+delta at plan switches.
 
-Use this as the command template. Only change the benchmark parameters shown in each phase.
+## Phase 2: Find velocity limits
 
-```bash
-uv run python examples/spirit-ai/main.py \
-  --policy-host localhost \
-  --policy-port 8000 \
-  --robot-url ws://172.16.0.30:8766 \
-  --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps" \
-  --enable-external-following \
-  --startup-delay-s 10 \
-  --source-hz 15 \
-  --blend-steps 4 \
-  --rollback-guard-steps 4 \
-  --rollback-scale 0.2 \
-  --max-arm-velocity-rad-s 0.28 \
-  --max-torso-velocity-rad-s 0.15 \
-  --max-gripper-velocity-s 0.8 \
-  --max-base-speed 0.05 \
-  --max-joint-accel-rad-s2 0.8 \
-  --prefetch-next-chunk \
-  --prefetch-delay-fraction 0.85 \
-  --max-steps 5
-```
+Fix the selected `control.source_hz`, then compare YAML profiles with conservative,
+incremental arm and torso velocity limits. Begin below the known hardware limit and
+increase only after a low-speed run is stable. If motion is sluggish, inspect command
+delta, control frequency, and latency before relaxing a limit; if jitter returns,
+return to the prior profile and investigate the model/data behavior.
 
-## Phase 1: Find `source_hz`
+## Phase 3: Find acceleration limit
 
-Keep all other parameters fixed:
+Fix `control.source_hz` and velocity limits, then compare
+`control.motion_limits.max_joint_accel_rad_s2` candidates. Keep `0.0` only when the
+resulting low-speed motion and switch deltas are acceptable; otherwise prefer the
+smallest limit that avoids abrupt starts, stops, or reversals.
 
-```text
-arm_vel=0.28
-torso_vel=0.15
-accel=0.8
-```
+## Decision and reporting
 
-Test in this order:
-
-| Candidate | Change |
-|-----------|--------|
-| A | `--source-hz 15` |
-| B | `--source-hz 20` |
-| C | `--source-hz 25` |
-| D | `--source-hz 12` |
-
-Decision rule:
-
-- If `20` is more continuous than `15` without bringing back jitter, use `20`.
-- If `25` looks rushed or produces more chunk-boundary jerk, reject `25`.
-- If `12` is stable but too slow or task intent drops, reject `12`.
-
-Expected best candidate: `source_hz=20`.
-
-## Phase 2: Find Velocity Limits
-
-Fix the best `source_hz` from Phase 1. Test:
-
-| Candidate | arm_vel | torso_vel | Expected behavior |
-|-----------|---------|-----------|-------------------|
-| A | `0.22` | `0.12` | Most stable, may be too slow |
-| B | `0.28` | `0.15` | Recommended balance |
-| C | `0.35` | `0.20` | More responsive, may shake slightly |
-| D | `0.45` | `0.25` | Fastest, higher risk |
-
-Decision rule:
-
-- If motion is stable but sluggish, increase one level.
-- If task intent is good but jitter returns, decrease one level.
-- If `limited_fraction` stays near `1.0`, the velocity limit is too strict for the current policy output.
-
-Expected best candidate: `arm_vel=0.28`, `torso_vel=0.15`, or one level higher if motion is too slow.
-
-## Phase 3: Find Acceleration Limit
-
-Fix the best `source_hz`, `arm_vel`, and `torso_vel` from Phases 1-2. Test:
-
-| Candidate | accel | Expected behavior |
-|-----------|-------|-------------------|
-| A | `0.0` | No acceleration limiting; fastest response |
-| B | `0.5` | Softest, may lag |
-| C | `0.8` | Recommended balance |
-| D | `1.2` | More responsive, less smoothing |
-
-Decision rule:
-
-- If starts/stops or direction changes feel abrupt, reduce accel.
-- If the robot lags behind the intended motion, increase accel or set it to `0.0`.
-- If disabling accel improves continuity without jitter, keep `0.0`.
-
-Expected best candidate: `accel=0.8` or `1.2`.
-
-## Suggested Fast Sweep
-
-Run only these six candidates first:
-
-| Run | source_hz | arm_vel | torso_vel | accel |
-|-----|-----------|---------|-----------|-------|
-| 1 | `15` | `0.28` | `0.15` | `0.8` |
-| 2 | `20` | `0.28` | `0.15` | `0.8` |
-| 3 | `25` | `0.28` | `0.15` | `0.8` |
-| 4 | best from 1-3 | `0.35` | `0.20` | `0.8` |
-| 5 | best from 1-3 | `0.22` | `0.12` | `0.8` |
-| 6 | best from 1-5 | best from 1-5 | best from 1-5 | `1.2` |
-
-After selecting the best candidate, rerun it with:
-
-```bash
---max-steps 20
-```
-
-Only move to longer runs after the 20-step run remains stable and task intent is good.
-
-## Current Recommended Candidate
-
-Start with:
-
-```text
-source_hz=20
-max_arm_velocity_rad_s=0.28
-max_torso_velocity_rad_s=0.15
-max_joint_accel_rad_s2=0.8
-```
-
-If it is still not continuous enough, try:
-
-```text
-source_hz=20
-max_arm_velocity_rad_s=0.35
-max_torso_velocity_rad_s=0.20
-max_joint_accel_rad_s2=1.2
-```
-
-If jitter returns, go back to the previous candidate.
+Select the YAML profile only when it has no unexplained misses or holds, stays within
+the trained/planned delay capability, and is acceptable in the low-speed hardware
+run. Archive the exact YAML profile with the metrics table above. Do not compensate
+for an unsafe result with retired prefetch, execution-window, or RTC-guidance flags.

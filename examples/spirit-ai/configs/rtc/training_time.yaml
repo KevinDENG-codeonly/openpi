@@ -1,0 +1,41 @@
+schema_version: 1
+# Training-time RTC total write-deadline safety currently requires non-TLS ws:// endpoints.
+policy: {host: localhost, port: 8000, prompt: "Use both grippers to erect carton blank from partially opened box, fold and press both side walls inward to form open box body, and then place formed box in right side placement area on table.Current step: <Use the left gripper to push the carton blank from the initial position to the center of the work area, then make a small adjustment so that the blank is properly aligned.>", connect_timeout_s: 1.0}
+robot:
+  url: ws://172.16.0.30:8766
+  action_layout: cartesian
+  enable_external_following: true
+  initial_gripper_obs_state: 0.0965
+  gripper_initial_tolerance: 0.00965
+  gripper_reset_command_state: 1.0
+  gripper_reset_steps: 20
+control:
+  source_hz: 30.0
+  max_steps: 10000
+  busy_sleep_s: 0.01
+  startup_delay_s: 10.0
+  blend_steps: 4
+  rollback_guard_steps: 4
+  rollback_scale: 0.2
+  rpc_budget_fraction: 0.99
+  command_ack_timeout_s: 1.0
+  # Total wall-clock budget for each startup, reset, and runtime idle preflight.
+  robot_idle_timeout_s: 10.0
+  motion_limits:
+    max_arm_velocity_rad_s: 0.35
+    max_torso_velocity_rad_s: 0.2
+    max_gripper_velocity_s: 0.8
+    # This folding policy never controls the mobile base.
+    max_base_speed: 0.0
+    max_joint_accel_rad_s2: 0.0
+    max_cart_translation_m_s: 0.08
+    max_cart_rotation_rad_s: 0.35
+    max_torso_cart_translation_m_s: 0.04
+    max_torso_cart_rotation_rad_s: 0.2
+    max_cart_accel: 0.0
+rtc:
+  mode: training_time
+  s_min: 10
+  initial_inference_timeout_s: 10.0
+  delay: {planned_max_steps: 15, history_window: 32, safety_margin_steps: 1}
+  deadline_miss: {max_consecutive: 2, action: hold_then_stop}

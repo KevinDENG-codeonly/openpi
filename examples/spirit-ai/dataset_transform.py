@@ -28,8 +28,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import shutil
 from pathlib import Path
+import shutil
 
 from utils import annotations
 from utils import instructions
@@ -277,11 +277,9 @@ def run_verify_video_sync(args: argparse.Namespace) -> None:
     print(f"Issues:           {len(summary.issues)}")
     for issue in summary.issues:
         print(
-            (
-                f"  episode={issue.episode_index} key={issue.video_key}: {issue.message} "
-                f"parquet_rows={issue.parquet_rows} decoded_frames={issue.decoded_frames} "
-                f"parquet_ts={issue.parquet_timestamp} decoded_ts={issue.decoded_timestamp}"
-            )
+            f"  episode={issue.episode_index} key={issue.video_key}: {issue.message} "
+            f"parquet_rows={issue.parquet_rows} decoded_frames={issue.decoded_frames} "
+            f"parquet_ts={issue.parquet_timestamp} decoded_ts={issue.decoded_timestamp}"
         )
     if summary.issues:
         raise SystemExit(1)
@@ -312,6 +310,73 @@ def run_merge_datasets(args: argparse.Namespace) -> None:
         fraction = summary.supplement_frames / summary.total_frames
         print(f"Supplement fraction:  {fraction:.2%}")
     print("Done.")
+
+
+def run_plan_global_prompt_augmentation(args: argparse.Namespace) -> None:
+    from utils import global_prompt_augmenter
+
+    dataset_dir = Path(args.dataset_dir).resolve()
+    manifest_path = Path(args.manifest_path).resolve()
+    plan = global_prompt_augmenter.plan_global_prompt_augmentation(
+        dataset_dir=dataset_dir,
+        global_task_index=args.global_task_index,
+        duplicate_episode_fraction=args.duplicate_episode_fraction,
+        candidate_count=args.candidate_count,
+        seed=args.seed,
+    )
+    global_prompt_augmenter.write_plan_manifest(manifest_path, plan)
+    print(f"Sampling manifest: {manifest_path}")
+    print(f"Selected trial:    {plan.selected_trial}/{plan.candidate_count - 1}")
+    print(f"Selected episodes:  {len(plan.selected_episode_indices)}")
+    print(f"Duplicate frames:   {plan.selected_duplicate_frames}")
+    print(f"Duplicate ratio:    {plan.selected_duplicate_frame_ratio:.2%} of source frames")
+    print(f"Global share:       {plan.selected_final_global_prompt_ratio:.2%} of final frames")
+    print(f"Episode IDs:        {list(plan.selected_episode_indices)}")
+    print("Review this manifest before running augment-global-prompts.")
+
+
+def run_augment_global_prompts(args: argparse.Namespace) -> None:
+    from utils import global_prompt_augmenter
+
+    plan = global_prompt_augmenter.read_plan_manifest(Path(args.selection_manifest).resolve())
+    summary = global_prompt_augmenter.build_global_prompt_augmented_dataset(
+        dataset_dir=Path(args.dataset_dir).resolve(),
+        output_dir=Path(args.output_dir).resolve(),
+        plan=plan,
+        overwrite=args.overwrite,
+        progress=not args.quiet,
+    )
+    print(f"Output dataset:    {summary.output_dir}")
+    print(f"Total episodes:    {summary.total_episodes}")
+    print(f"Total frames:      {summary.total_frames}")
+    print(f"Total tasks:       {summary.total_tasks}")
+    print(f"Duplicate episodes: {summary.duplicate_episodes}")
+    print(f"Duplicate frames:   {summary.duplicate_frames}")
+    print(f"Global frame share:  {summary.final_global_prompt_ratio:.2%}")
+    print("Done.")
+
+
+def run_validate_global_prompt_augmentation(args: argparse.Namespace) -> None:
+    from utils import global_prompt_augmenter
+
+    plan = global_prompt_augmenter.read_plan_manifest(Path(args.selection_manifest).resolve())
+    report = global_prompt_augmenter.validate_global_prompt_augmented_dataset(
+        dataset_dir=Path(args.dataset_dir).resolve(),
+        plan=plan,
+        action_horizon=args.action_horizon,
+    )
+    print(f"Validated dataset: {Path(args.dataset_dir).resolve()}")
+    print(f"Total episodes:    {report.total_episodes}")
+    print(f"Total frames:      {report.total_frames}")
+    print(f"Duplicate episodes: {report.duplicate_episodes}")
+    print(f"Duplicate frames:   {report.duplicate_frames}")
+    print(f"Global frame share:  {report.global_prompt_frame_ratio:.2%}")
+    print(f"Task index counts:   {report.task_index_counts}")
+    print(
+        f"Action horizon H={args.action_horizon}: crossing_starts="
+        f"{report.action_horizon_crossing_frames}/{report.action_horizon_checked_frames}"
+    )
+    print("PASS - Global prompt augmentation validation passed.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -407,6 +472,46 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--quiet", action="store_true", help="Disable merge progress messages.")
     merge.add_argument("--overwrite", action="store_true")
 
+    plan_global = subparsers.add_parser(
+        "plan-global-prompt-augmentation",
+        help="Draw reproducible random duplicate-episode candidates and write a review manifest.",
+    )
+    plan_global.add_argument("--dataset-dir", "--dataset_dir", dest="dataset_dir", required=True)
+    plan_global.add_argument("--manifest-path", "--manifest_path", dest="manifest_path", required=True)
+    plan_global.add_argument("--global-task-index", "--global_task_index", dest="global_task_index", type=int, default=39)
+    plan_global.add_argument(
+        "--duplicate-episode-fraction",
+        "--duplicate_episode_fraction",
+        dest="duplicate_episode_fraction",
+        type=float,
+        default=0.25,
+    )
+    plan_global.add_argument("--candidate-count", "--candidate_count", dest="candidate_count", type=int, default=1000)
+    plan_global.add_argument("--seed", type=int, default=20260811)
+
+    augment_global = subparsers.add_parser(
+        "augment-global-prompts",
+        help="Build a physical-copy augmentation from a reviewed selection manifest.",
+    )
+    augment_global.add_argument("--dataset-dir", "--dataset_dir", dest="dataset_dir", required=True)
+    augment_global.add_argument("--output-dir", "--output_dir", dest="output_dir", required=True)
+    augment_global.add_argument("--selection-manifest", "--selection_manifest", dest="selection_manifest", required=True)
+    augment_global.add_argument("--overwrite", action="store_true")
+    augment_global.add_argument("--quiet", action="store_true", help="Disable build progress messages.")
+
+    validate_global = subparsers.add_parser(
+        "validate-global-prompt-augmentation",
+        help="Validate metadata, prompt mapping, global indices, and physical duplicate files.",
+    )
+    validate_global.add_argument("--dataset-dir", "--dataset_dir", dest="dataset_dir", required=True)
+    validate_global.add_argument(
+        "--selection-manifest",
+        "--selection_manifest",
+        dest="selection_manifest",
+        required=True,
+    )
+    validate_global.add_argument("--action-horizon", "--action_horizon", dest="action_horizon", type=int, default=10)
+
     return parser
 
 
@@ -429,6 +534,12 @@ def main(argv: list[str] | None = None) -> None:
         run_verify_video_sync(args)
     elif args.command == "merge-datasets":
         run_merge_datasets(args)
+    elif args.command == "plan-global-prompt-augmentation":
+        run_plan_global_prompt_augmentation(args)
+    elif args.command == "augment-global-prompts":
+        run_augment_global_prompts(args)
+    elif args.command == "validate-global-prompt-augmentation":
+        run_validate_global_prompt_augmentation(args)
     else:
         parser.error(f"Unknown command: {args.command}")
 

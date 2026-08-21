@@ -1,109 +1,72 @@
-# Spirit AI Real Robot Deployment Notes
+# Spirit AI Real Robot Operational Notes
 
-This note records the current Thor `robot_server` deployment status, real robot inference behavior, and motion-tuning conclusions. Keep the main [`README.md`](README.md) focused on the standard workflow; use this file for operational context and experimental interpretation.
+These notes describe the current training-time RTC runner for the Thor
+`robot_server` bridge. The former chunk-prefetch and flag-driven deployment guide
+is retired and must not be used for robot operation.
 
-## Current Deployment
+## Current deployment and profile
 
-- Thor runs `robot_server` in Docker and listens on `ws://172.16.0.30:8766`.
-- Precision runs the local policy server on `localhost:8000`.
-- [`main.py`](main.py) bridges the local policy server to the remote Thor `robot_server`.
-- Current Thor metadata:
+- Thor runs `robot_server` and the default profile uses its non-TLS `ws://` robot
+  endpoint.
+- Precision runs the policy server; its effective RTC policy transport must also be
+  non-TLS `ws://`. The runner rejects `wss://` before policy or hardware activity
+  because Python TLS sockets cannot provide the Linux total write-deadline guarantee.
+- `examples/spirit-ai/main.py` owns the robot WebSocket. Its single-flight worker
+  owns the policy connection, and the main thread sends at most one robot action per
+  accepted control tick.
+- The JAX Pi0.5 checkpoint must have been trained with `rtc_training.enabled` and
+  advertise `rtc_capabilities.algorithm: training_time_v1`.
 
-| Field | Value |
-|-------|-------|
-| `structure` | `wholebody` |
-| `joint_dim` | `25` |
-| `accepted_joint_dims` | `[16, 22, 25]` |
-| required cameras | `cam_high`, `cam_left_wrist`, `cam_right_wrist` |
+Choose the deployment settings in a strict YAML profile, based on
+`examples/spirit-ai/configs/rtc/training_time.yaml`:
 
-External following must be enabled for real arm motion:
+- `robot.action_layout` must be `joint` for a 27D joint checkpoint or `cartesian`
+  for a 25D Cartesian checkpoint. Serve the matching checkpoint; do not try to adapt
+  a mismatched action layout at runtime.
+- Set `robot.enable_external_following: true` before an authorized real-arm run.
+  Without it, the server may accept commands while arm joint state does not
+  meaningfully follow.
+- Configure blend, rollback, and motion safety under `control.blend_steps`,
+  `control.rollback_guard_steps`, `control.rollback_scale`, and
+  `control.motion_limits`.
+- Keep `policy.connect_timeout_s`, `rtc.initial_inference_timeout_s`,
+  `control.command_ack_timeout_s`, and `control.robot_idle_timeout_s` as explicit
+  safety bounds rather than throughput-tuning controls.
 
-```bash
---enable-external-following
-```
+## Safe launch sequence
 
-Without external following, `robot_server` can accept command chunks while arm joint states do not meaningfully follow.
-
-## Work Completed
-
-- Replaced the old direct SDK/RealSense real robot path with a two-machine bridge.
-- Added `robot_server` protocol support for enabling external following mode.
-- Added chunk-start smoothing:
-  - `--blend-steps`
-  - `--rollback-guard-steps`
-  - `--rollback-scale`
-- Added Precision-side motion limiting:
-  - `--max-arm-velocity-rad-s`
-  - `--max-torso-velocity-rad-s`
-  - `--max-gripper-velocity-s`
-  - `--max-base-speed`
-  - `--max-joint-accel-rad-s2`
-- Added logs for actual state delta, command first-frame delta, raw/limited max velocity, and `limited_fraction`.
-
-## Current Motion Findings
-
-The robot moves reliably with external following enabled, but the latest tests show a tradeoff between less shaking and good continuity.
-
-| Setting | Jitter | Continuity | Task intent | Notes |
-|---------|--------|------------|-------------|-------|
-| `source_hz=15`, `arm=0.28`, `torso=0.15`, `accel=0.8`, prefetch `0.85` | noticeable shake | medium-low | good | `limited_fraction` often around `0.45-0.60` |
-| Same, prefetch `0.1` | worse shake | poor | unstable | prefetch likely too early; stale observation effect |
-| Same, `--no-prefetch-next-chunk` | slightly less shake | poor | acceptable | less stale observation, but chunk-to-chunk waiting hurts continuity |
-
-Observed trends:
-
-| Variable | Trend |
-|----------|-------|
-| Lower velocity | Less shaking, but too low can make motion slow and discontinuous |
-| Higher velocity | More responsive, but shaking returns more easily |
-| `accel=0.0` | Least shaking in earlier notes, but continuity was worse |
-| `accel=0.8-1.2` | Better continuity, slightly more shaking |
-| `source_hz=12` | More continuous but weaker task intent |
-| `source_hz=15` | Best balance seen so far |
-| `source_hz=20` | More responsive but can shake more |
-
-## Interpretation
-
-The remaining issue is probably not one single parameter.
-
-1. Policy output is still high-velocity relative to safe real robot execution; logs often show `raw_max_vel` much larger than `limited_max_vel`.
-2. The limiter is changing a large fraction of the output; `limited_fraction` around `0.45-0.60` means the executed trajectory is materially different from the model output.
-3. Chunk-level control is fighting continuous motion; each 10-frame chunk is smoothed locally, but there is no global trajectory optimizer across chunks.
-4. Prefetch is a tradeoff: early prefetch can use stale observations, while no prefetch adds inference gaps.
-5. Thor-side PCHIP interpolation upsamples each chunk to 120Hz, but does not enforce global velocity, acceleration, or jerk continuity across chunk boundaries.
-
-## Safest Reference Command
-
-Use short runs while debugging:
+Use the canonical dry-run command for every new profile or checkpoint:
 
 ```bash
-uv run python examples/spirit-ai/main.py \
-  --policy-host localhost \
-  --policy-port 8000 \
-  --robot-url ws://172.16.0.30:8766 \
-  --prompt "Assemble the cardboard box by erecting the flat sheet and folding the side flaps" \
-  --enable-external-following \
-  --startup-delay-s 10 \
-  --source-hz 15 \
-  --blend-steps 4 \
-  --rollback-guard-steps 4 \
-  --rollback-scale 0.2 \
-  --max-arm-velocity-rad-s 0.28 \
-  --max-torso-velocity-rad-s 0.15 \
-  --max-gripper-velocity-s 0.8 \
-  --max-base-speed 0.05 \
-  --max-joint-accel-rad-s2 0.8 \
-  --no-prefetch-next-chunk \
-  --max-steps 10
+uv run examples/spirit-ai/main.py --config PATH --dry-run
 ```
 
-Use [`motion_benchmark_plan.md`](motion_benchmark_plan.md) for the full benchmark matrix.
+Confirm the resolved YAML path, checkpoint capability metadata, action layout, and
+read-only robot preflight. Measure end-to-end latency at the selected
+`control.source_hz` before training and deployment, then keep training
+`max_delay_steps` and YAML `rtc.delay.planned_max_steps` in the same safe range.
+Only after explicit operator authorization should a low-speed run omit `--dry-run`.
 
-## Recommended Next Engineering Work
+## Required runtime evidence
 
-Parameter tuning alone is reaching diminishing returns. The next useful implementation work is one of:
+For every hardware experiment, record:
 
-- Add a cross-chunk trajectory buffer that blends from the currently executing tail into the next policy chunk.
-- Move velocity, acceleration, and jerk limiting to Thor after PCHIP resampling, so the final 120Hz command stream is globally limited.
-- Log policy inference latency, chunk idle time, and boundary discontinuity between the previous chunk tail and the next chunk head.
-- Replay a recorded human/demo joint trajectory through the same `robot_server` path. If replay is smooth but policy control is not, the issue is mostly policy output and bridge execution. If replay also shakes, the issue is lower in the robot command or interpolation path.
+- `dplan` and `dactual`;
+- deadline misses and holds;
+- command delta at plan switches;
+- achieved control frequency; and
+- end-to-end inference latency.
+
+Investigate a command ACK timeout, RPC-budget stop, deadline miss, hold, or large
+switch delta before continuing. The runner stops scheduling and closes transports on
+configured failures; when applicable it sends the configured one-row terminal hold
+before stopping.
+
+## Historical physical observations
+
+The following observations are retained only as historical context from pre-
+training-time-RTC experiments, not as a tuning prescription: lower velocity limits
+often reduced visible shaking but could slow task progress, while higher limits made
+the system more responsive but could reveal jitter. Re-evaluate these tradeoffs with
+the YAML benchmark process in [`motion_benchmark_plan.md`](motion_benchmark_plan.md)
+and the required runtime metrics above.
