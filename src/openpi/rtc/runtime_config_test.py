@@ -305,7 +305,7 @@ def test_checked_in_default_profile_loads_with_30hz_rtc_defaults() -> None:
         1,
         "localhost",
         8000,
-        "fold the paper box",
+        "Use both grippers to erect carton blank from partially opened box, fold and press both side walls inward to form open box body, and then place formed box in right side placement area on table.Current step: <Use the left gripper to push the carton blank from the initial position to the center of the work area, then make a small adjustment so that the blank is properly aligned.>",
         1.0,
     )
     assert (
@@ -316,7 +316,7 @@ def test_checked_in_default_profile_loads_with_30hz_rtc_defaults() -> None:
         cfg.robot.gripper_initial_tolerance,
         cfg.robot.gripper_reset_command_state,
         cfg.robot.gripper_reset_steps,
-    ) == ("ws://172.16.0.30:8766", "cartesian", False, 0.0965, 0.00965, 1.0, 20)
+    ) == ("ws://172.16.0.30:8766", "cartesian", True, 0.0965, 0.00965, 1.0, 20)
     assert (
         cfg.control.source_hz,
         cfg.control.max_steps,
@@ -328,7 +328,7 @@ def test_checked_in_default_profile_loads_with_30hz_rtc_defaults() -> None:
         cfg.control.rpc_budget_fraction,
         cfg.control.command_ack_timeout_s,
         cfg.control.robot_idle_timeout_s,
-    ) == (30.0, 4000, 0.01, 10.0, 4, 4, 0.2, 0.7, 1.0, 10.0)
+    ) == (30.0, 10000, 0.01, 10.0, 4, 4, 0.2, 0.99, 1.0, 10.0)
     expected_motion_limits = dict(VALID_RUNTIME["control"]["motion_limits"])
     expected_motion_limits["max_base_speed"] = 0.0
     assert dataclasses.asdict(cfg.control.motion_limits) == expected_motion_limits
